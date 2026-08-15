@@ -1,0 +1,21 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite3
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Local tooling artifacts (symlinks into site-packages, not project files)
+.claude/
+.agents/
+
+# Internal notes — not for the public repo
+TECH_STACK.md
+implementation_plan.md
