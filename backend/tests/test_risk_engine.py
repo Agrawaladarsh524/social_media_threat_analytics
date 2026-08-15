@@ -82,3 +82,24 @@ def test_posting_entropy_uniform_vs_concentrated():
 
 def test_posting_entropy_no_data_defaults_to_unpredictable():
     assert posting_entropy([0] * 24) == 1.0
+
+
+def test_linkedin_sparse_profile_dampens_predictability_not_pii():
+    """Mirrors the Twitter confidence test: a profile with a listed employer
+    but almost no other career data shouldn't be scored as confidently
+    predictable as a fully detailed one, but the employer disclosure itself
+    is still a real, undamped finding."""
+    sparse = score_linkedin_profile({'employer_count': 5, 'field_completeness': 0.33, 'current_employer': 'Acme'})
+    full = score_linkedin_profile({'employer_count': 5, 'field_completeness': 1.0, 'current_employer': 'Acme'})
+    assert sparse.confidence < full.confidence
+    assert sparse.score < full.score
+    sparse_pii = next(f.points for f in sparse.factors if 'Current employer' in f.label)
+    full_pii = next(f.points for f in full.factors if 'Current employer' in f.label)
+    assert sparse_pii == full_pii == 10  # undamped regardless of field completeness
+
+
+def test_linkedin_field_completeness_defaults_to_full_confidence():
+    """Backward-compatible default: callers that don't pass field_completeness
+    (e.g. older test fixtures) get undamped scoring, not silently zeroed out."""
+    result = score_linkedin_profile({'employer_count': 5})
+    assert result.confidence == 1.0

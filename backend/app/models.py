@@ -119,3 +119,27 @@ class LinkedInProfile(Base):
 
     def __repr__(self) -> str:
         return f'<LinkedInProfile @{self.public_identifier} (Risk: {self.risk_score})>'
+
+
+class RiskSnapshot(Base):
+    """
+    Append-only audit trail: one row per scoring event. Never overwritten —
+    local_ingest.py inserts a new row every time a profile is (re-)scored,
+    instead of only updating the profile's "latest" columns in place. This
+    is what makes "how has this profile's exposure changed" answerable at
+    all: a re-ingestion after a scoring-methodology change produces a real,
+    honest second data point, not a synthetic backfill.
+    """
+
+    __tablename__ = 'risk_snapshots'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    platform: Mapped[str] = mapped_column(String(20), index=True)
+    profile_identifier: Mapped[str] = mapped_column(String(255), index=True)  # username or public_identifier
+    scanned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
+    risk_score: Mapped[int] = mapped_column(Integer)
+    risk_label: Mapped[str] = mapped_column(String(255), default='')
+    risk_factors: Mapped[list[Any]] = mapped_column(JSON, default=list)
+
+    def __repr__(self) -> str:
+        return f'<RiskSnapshot {self.platform}:{self.profile_identifier} @{self.scanned_at} (Risk: {self.risk_score})>'

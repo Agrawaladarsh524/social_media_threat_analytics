@@ -158,9 +158,19 @@ def score_linkedin_profile(features: dict[str, Any]) -> RiskResult:
     """
     features keys: location_disclosed (0/1/2/3 = none/country/state/city),
     current_employer (str), employer_count, education_disclosed,
+    field_completeness (0-1, how much career data is actually present),
     open_to_work, is_hiring, connections_count, follower_count.
+
+    The career-timeline predictability term is confidence-weighted by
+    field_completeness for the same reason Twitter's predictability term is
+    confidence-weighted by tweet count: a profile with one listed employer
+    because the export is sparse shouldn't be treated with the same
+    certainty as one with a fully detailed history. PII and content-status
+    findings are direct disclosures, not statistical inferences, so — as on
+    the Twitter side — they are left undamped.
     """
     factors: list[RiskFactor] = []
+    confidence = float(features.get('field_completeness', 1.0))
 
     # --- PII exposure (0-40) --- explicit disclosure is worth more than inference.
     pii = 0.0
@@ -187,11 +197,15 @@ def score_linkedin_profile(features: dict[str, Any]) -> RiskResult:
         factors.append(RiskFactor('pii_exposure', f'{entity_hits} entity mention(s) in headline/about (NER)', pts, 10, 'spaCy entities on headline/about'))
     pii = _clamp(pii, MAX_PII_EXPOSURE)
 
-    # --- Behavioral predictability / career timeline (0-25) ---
+    # --- Behavioral predictability / career timeline (0-25), confidence-weighted ---
     employer_count = int(features.get('employer_count', 0))
-    timeline = round(min(employer_count / 5, 1) * MAX_PREDICTABILITY, 1)
+    raw_timeline = min(employer_count / 5, 1) * MAX_PREDICTABILITY
+    timeline = round(raw_timeline * confidence, 1)
     if timeline > 0.5:
-        factors.append(RiskFactor('predictability', f'{employer_count}-employer career timeline reconstructable', timeline, MAX_PREDICTABILITY, 'experiences_json (dated entries)'))
+        factors.append(RiskFactor(
+            'predictability', f'{employer_count}-employer career timeline reconstructable', timeline, MAX_PREDICTABILITY,
+            f'experiences_json (dated entries), field completeness={confidence:.0%}',
+        ))
     predictability = _clamp(timeline, MAX_PREDICTABILITY)
 
     # --- Content/status sensitivity (0-20) ---
@@ -213,4 +227,4 @@ def score_linkedin_profile(features: dict[str, Any]) -> RiskResult:
 
     total = round(pii + predictability + content + reach)
     total = max(0, min(total, 100))
-    return RiskResult(score=total, tier=_tier_for(total), factors=factors)
+    return RiskResult(score=total, tier=_tier_for(total), confidence=confidence, factors=factors)

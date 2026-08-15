@@ -1,6 +1,7 @@
 """Tests for local spaCy NER extraction and feature engineering — no network
-calls, no OpenAI key. spaCy's en_core_web_sm must be installed
-(`python -m spacy download en_core_web_sm`)."""
+calls, no OpenAI key. spaCy's en_core_web_sm and the sentence-transformers
+all-MiniLM-L6-v2 model must be available (the latter downloads automatically
+from Hugging Face on first use of semantic_content_hits)."""
 
 from app.services.nlp_features import (
     count_sensitive_keyword_hits,
@@ -8,6 +9,7 @@ from app.services.nlp_features import (
     extract_linkedin_features,
     extract_twitter_features,
     posting_hour_histogram,
+    semantic_content_hits,
     unpack_twitter_profile_meta,
 )
 
@@ -67,6 +69,33 @@ def test_extract_twitter_features_shape():
     assert features['has_email'] is False
     assert features['total_tweets'] == 2
     assert isinstance(inference_rows, list)
+    # combined keyword+semantic hit count must be at least the semantic-only count
+    # (union, not sum) — the "flying to New York tomorrow" tweet should register
+    # as a semantic hit even though it doesn't match the keyword dictionary verbatim.
+    assert features['sensitive_keyword_hits'] >= features['semantic_only_hits']
+
+
+def test_semantic_content_hits_distinguishes_near_term_from_past():
+    """The canonical example this feature exists for: same topic (travel/home),
+    but only one of these is a real near-term, specific exposure."""
+    near_term_count, near_term_hits = semantic_content_hits(['I am flying home tomorrow'])
+    past_count, _past_hits = semantic_content_hits(['I visited my parents last year'])
+
+    assert near_term_count >= 1
+    assert any(h['category'] == 'travel' for h in near_term_hits)
+    # Not a hard guarantee for every possible sentence pair, but for this
+    # specific canonical example the near-term disclosure must score a
+    # closer match than the past-tense one.
+    if near_term_hits:
+        near_term_sim = near_term_hits[0]['similarity']
+        _past_count2, past_hits2 = semantic_content_hits(['I visited my parents last year', 'I am flying home tomorrow'])
+        past_only_sim = next((h['similarity'] for h in past_hits2 if 'visited' in h['text']), 0.0)
+        assert near_term_sim >= past_only_sim
+
+
+def test_semantic_content_hits_empty_input():
+    assert semantic_content_hits([]) == (0, [])
+    assert semantic_content_hits(['', None]) == (0, [])
 
 
 def test_extract_linkedin_features_location_granularity():
@@ -95,3 +124,17 @@ def test_extract_linkedin_features_employer_and_flags():
     assert features['open_to_work'] is True
     assert features['is_hiring'] is False
     assert any(r['targetInfo'] == 'Current employer' for r in rows)
+
+
+def test_extract_linkedin_features_field_completeness():
+    full = {
+        'experiences_json': '[{"company_name": "Acme"}]',
+        'educations_json': '[{"school_name": "MIT"}]',
+        'profile_skills_json': '[{"skill_name": "python"}]',
+    }
+    features_full, _ = extract_linkedin_features(full)
+    assert features_full['field_completeness'] == 1.0
+
+    empty = {'experiences_json': '[]', 'educations_json': '[]', 'profile_skills_json': '[]'}
+    features_empty, _ = extract_linkedin_features(empty)
+    assert features_empty['field_completeness'] == 0.0

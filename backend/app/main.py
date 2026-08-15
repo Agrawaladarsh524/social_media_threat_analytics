@@ -23,8 +23,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title='OSINT-Guard API',
-    description='Twitter OSINT collection, AI risk scoring and analytics.',
-    version='2.0.0',
+    description=(
+        'Local exposure-risk intelligence for Twitter/X and LinkedIn OSINT data: '
+        'deterministic rule-based scoring, spaCy NER + semantic content analysis, '
+        'and unsupervised anomaly/persona detection. No external API key required. '
+        'Optional Apify/OpenAI endpoints are available but not depended on.'
+    ),
+    version='3.0.0',
     lifespan=lifespan,
 )
 

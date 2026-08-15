@@ -116,3 +116,47 @@ def test_clear_db_only_affects_specified_platform(client):
 
     assert client.get('/api/usernames/', params={'platform': 'twitter'}).json()['usernames'] == []
     assert client.get('/api/usernames/', params={'platform': 'linkedin'}).json()['usernames'] == ['jane-smith-1']
+
+
+def test_ingest_reports_data_quality(client):
+    r = _ingest(client, TWITTER_CSV, 'twitter', 'twitter.csv')
+    dq = r.json()['data_quality']
+    assert dq['rows_received'] == 2
+    assert dq['rows_skipped_no_handle'] == 0
+    assert dq['profiles_with_malformed_profile_json'] == 0
+
+    bad_csv = TWITTER_CSV.replace('twitter_handle', 'handle_typo')  # drops every handle
+    r2 = _ingest(client, bad_csv, 'twitter', 'bad.csv')
+    assert r2.json()['data_quality']['rows_skipped_no_handle'] == 2
+    assert r2.json()['profiles_ingested'] == 0
+
+
+def test_snapshot_history_grows_on_reingestion(client):
+    _ingest(client, TWITTER_CSV, 'twitter', 'twitter.csv')
+    first = client.get('/api/snapshots/twitter/janedoe/').json()
+    assert first['count'] == 1
+
+    _ingest(client, TWITTER_CSV, 'twitter', 'twitter.csv')  # re-score the same profile
+    second = client.get('/api/snapshots/twitter/janedoe/').json()
+    assert second['count'] == 2
+    assert second['snapshots'][0]['scanned_at'] <= second['snapshots'][1]['scanned_at']
+
+
+def test_recompute_models_force_retrain_param(client):
+    # Need >= MIN_PROFILES_FOR_ML distinct profiles for clustering to run at all.
+    rows_header = TWITTER_CSV.split('\n')[0]
+    csv_rows = [rows_header]
+    for i in range(10):
+        csv_rows.append(
+            f'{i},FOUNDER,Person {i},user{i},{i},{i}00,"hello world",https://x.com/{i},'
+            f'2026-01-0{(i % 9) + 1}T10:00:00,general,{i * 2},1,0,0,{i * 50},0,'
+            f'"{{""organization"": """", ""email"": null, ""followers_count"": {i * 100}, ""following_count"": 10}}"'
+        )
+    many_profiles_csv = '\n'.join(csv_rows) + '\n'
+    _ingest(client, many_profiles_csv, 'twitter', 'many.csv')
+
+    r1 = client.post('/api/recompute-models/', params={'platform': 'twitter'})
+    assert r1.json()['diagnostics']['cluster_ids_stable_across_refits'] is True
+
+    r2 = client.post('/api/recompute-models/', params={'platform': 'twitter', 'force_retrain': True})
+    assert r2.json()['diagnostics']['cluster_ids_stable_across_refits'] is False

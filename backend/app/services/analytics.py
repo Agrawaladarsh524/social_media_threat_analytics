@@ -45,8 +45,8 @@ def _risk_shared_charts(profiles: list, charts: dict) -> list:
 
     plt.figure(figsize=(9, 4))
     sns.histplot(all_scores, bins=min(len(all_scores), 15), kde=len(all_scores) > 3, color='#38bdf8')
-    plt.title('Risk Score Distribution Across All Profiles')
-    plt.xlabel('Risk Score (0-100)')
+    plt.title('Exposure Risk Score Distribution Across All Profiles')
+    plt.xlabel('Exposure Risk Score (0-100)')
     plt.ylabel('Number of Profiles')
     plt.tight_layout()
     charts['risk_distribution'] = _fig_to_base64()
@@ -105,7 +105,7 @@ def _build_twitter_charts(profiles: list) -> dict:
     charts: dict[str, str] = {}
     top15 = _risk_shared_charts(profiles, charts)
     if not top15:
-        return {'ok': False, 'error': 'No risk scores calculated yet. Run local ingestion first.'}
+        return {'ok': False, 'error': 'No exposure risk scores calculated yet. Run local ingestion first.'}
 
     usernames    = [p.username for p in top15]
     risk_scores  = [p.risk_score for p in top15]
@@ -116,8 +116,8 @@ def _build_twitter_charts(profiles: list) -> dict:
 
     fig, ax = plt.subplots(figsize=(9, max(4, len(top15) * 0.45)))
     bars = ax.barh(usernames[::-1], risk_scores[::-1], color='#f87171')
-    ax.set_xlabel('Risk Score (0-100)')
-    ax.set_title('Top Users by Risk Score')
+    ax.set_xlabel('Exposure Risk Score (0-100)')
+    ax.set_title('Top Users by Exposure Risk Score')
     ax.set_xlim(0, 100)
     for bar, score in zip(bars, risk_scores[::-1]):
         ax.text(bar.get_width() + 1, bar.get_y() + bar.get_height() / 2, str(score), va='center', fontsize=8)
@@ -152,8 +152,8 @@ def _build_twitter_charts(profiles: list) -> dict:
     for x, y, label in zip(sc_x, sc_y, [p.username for p in scored]):
         plt.annotate(f'@{label}', (x, y), textcoords='offset points', xytext=(5, 3), fontsize=7, color='#64748b')
     plt.xlabel('Avg Engagement per Tweet')
-    plt.ylabel('Risk Score')
-    plt.title('Risk Score vs Avg Engagement')
+    plt.ylabel('Exposure Risk Score')
+    plt.title('Exposure Risk Score vs Avg Engagement')
     plt.tight_layout()
     charts['risk_vs_engagement'] = _fig_to_base64()
 
@@ -179,7 +179,7 @@ def _build_linkedin_charts(profiles: list) -> dict:
     charts: dict[str, str] = {}
     top15 = _risk_shared_charts(profiles, charts)
     if not top15:
-        return {'ok': False, 'error': 'No risk scores calculated yet. Run local ingestion first.'}
+        return {'ok': False, 'error': 'No exposure risk scores calculated yet. Run local ingestion first.'}
 
     names = [p.full_name or p.public_identifier for p in top15]
     risk_scores = [p.risk_score for p in top15]
@@ -188,8 +188,8 @@ def _build_linkedin_charts(profiles: list) -> dict:
 
     fig, ax = plt.subplots(figsize=(9, max(4, len(top15) * 0.45)))
     bars = ax.barh(names[::-1], risk_scores[::-1], color='#f87171')
-    ax.set_xlabel('Risk Score (0-100)')
-    ax.set_title('Top LinkedIn Profiles by Risk Score')
+    ax.set_xlabel('Exposure Risk Score (0-100)')
+    ax.set_title('Top LinkedIn Profiles by Exposure Risk Score')
     ax.set_xlim(0, 100)
     for bar, score in zip(bars, risk_scores[::-1]):
         ax.text(bar.get_width() + 1, bar.get_y() + bar.get_height() / 2, str(score), va='center', fontsize=8)
@@ -237,8 +237,8 @@ def _build_linkedin_charts(profiles: list) -> dict:
     sc_y = [p.risk_score for p in scored]
     plt.scatter(sc_x, sc_y, color='#a78bfa', alpha=0.7, edgecolors='white', linewidths=0.4, s=60)
     plt.xlabel('Connections + Followers')
-    plt.ylabel('Risk Score')
-    plt.title('Risk Score vs Professional Reach')
+    plt.ylabel('Exposure Risk Score')
+    plt.title('Exposure Risk Score vs Professional Reach')
     plt.tight_layout()
     charts['risk_vs_reach'] = _fig_to_base64()
 

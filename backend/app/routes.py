@@ -16,12 +16,12 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .database import get_db
-from .models import LinkedInProfile, TwitterProfile
+from .models import LinkedInProfile, RiskSnapshot, TwitterProfile
 from .schemas import CollectRequest, InsightsRequest
 from .services.analytics import build_charts
 from .services.apify_collect import collect_osint
 from .services.local_ingest import ingest_linkedin_rows, ingest_twitter_rows
-from .services.ml_models import linkedin_ml_features, run_anomaly_and_clusters, twitter_ml_features
+from .services.ml_models import clear_persisted_models, linkedin_ml_features, run_anomaly_and_clusters, twitter_ml_features
 from .services.openai_insights import generate_ai_bundle
 from .services.stats import build_profile_defaults
 
@@ -106,10 +106,10 @@ def insights(payload: InsightsRequest, db: Session = Depends(get_db)) -> JSONRes
             timeout=settings.OPENAI_REQUEST_TIMEOUT,
         )
     except Exception:
-        return JSONResponse(
-            {'ok': False, 'error': 'openai_failed', 'detail': traceback.format_exc()[-2000:]},
-            status_code=502,
-        )
+        body: dict[str, Any] = {'ok': False, 'error': 'openai_failed'}
+        if settings.DEBUG:
+            body['detail'] = traceback.format_exc()[-2000:]
+        return JSONResponse(body, status_code=502)
 
     if username:
         try:
@@ -208,22 +208,27 @@ async def ingest_local(
         return JSONResponse({'ok': False, 'error': 'CSV has no rows.'}, status_code=400)
 
     if platform == 'twitter':
-        count = ingest_twitter_rows(db, rows)
+        quality = ingest_twitter_rows(db, rows)
     else:
-        count = ingest_linkedin_rows(db, rows)
+        quality = ingest_linkedin_rows(db, rows)
 
+    count = quality['ingested']
     return JSONResponse({
         'ok': True,
         'platform': platform,
         'profiles_ingested': count,
+        'data_quality': quality,
         'message': f'{count} {platform} profile(s) ingested via the local rule-based/NER pipeline (no AI key used).',
     })
 
 
 @router.post('/recompute-models/')
-def recompute_models(platform: str = 'twitter', db: Session = Depends(get_db)) -> JSONResponse:
+def recompute_models(platform: str = 'twitter', force_retrain: bool = False, db: Session = Depends(get_db)) -> JSONResponse:
     """Refit Isolation Forest (anomaly) + KMeans (clustering) across every
-    stored profile for a platform, and persist the results."""
+    stored profile for a platform, and persist the results. By default,
+    KMeans cluster IDs are matched back to the previous run's so persona
+    identity survives the refit — pass force_retrain=true to reset that and
+    get a fresh, unmatched clustering baseline instead."""
     if platform not in PLATFORM_MODELS:
         return JSONResponse({'ok': False, 'error': "platform must be 'twitter' or 'linkedin'"}, status_code=400)
 
@@ -231,7 +236,9 @@ def recompute_models(platform: str = 'twitter', db: Session = Depends(get_db)) -
     feature_fn = twitter_ml_features if platform == 'twitter' else linkedin_ml_features
     profiles = list(db.scalars(select(model)))
 
-    anomaly_by_id, cluster_by_id, diagnostics = run_anomaly_and_clusters(profiles, feature_fn)
+    anomaly_by_id, cluster_by_id, diagnostics = run_anomaly_and_clusters(
+        profiles, feature_fn, platform, force_retrain=force_retrain,
+    )
     for p in profiles:
         p.anomaly_score = anomaly_by_id.get(p.id)
         p.cluster_id = cluster_by_id.get(p.id)
@@ -385,12 +392,45 @@ def profile_detail(platform: str, identifier: str, db: Session = Depends(get_db)
     })
 
 
+@router.get('/snapshots/{platform}/{identifier}/')
+def snapshot_history(platform: str, identifier: str, db: Session = Depends(get_db)) -> JSONResponse:
+    """Every past scoring event for one profile, oldest first — the audit
+    trail behind 'has this profile's exposure score changed.' Real history,
+    not a synthetic backfill: a new row is written every time the profile
+    is (re-)scored, so this only has more than one entry once you've
+    actually re-ingested (e.g. after a scoring-methodology change)."""
+    if platform not in PLATFORM_MODELS:
+        return JSONResponse({'ok': False, 'error': "platform must be 'twitter' or 'linkedin'"}, status_code=400)
+
+    rows = list(db.scalars(
+        select(RiskSnapshot)
+        .where(RiskSnapshot.platform == platform, RiskSnapshot.profile_identifier.ilike(identifier))
+        .order_by(RiskSnapshot.scanned_at.asc())
+    ))
+    return JSONResponse({
+        'ok': True,
+        'count': len(rows),
+        'snapshots': [
+            {
+                'scanned_at': _fmt(r.scanned_at),
+                'risk_score': r.risk_score,
+                'risk_label': r.risk_label,
+            }
+            for r in rows
+        ],
+    })
+
+
 @router.api_route('/clear-db/', methods=['GET', 'POST', 'DELETE'])
 def clear_db(platform: str = 'twitter', db: Session = Depends(get_db)) -> JSONResponse:
-    """Wipe every stored profile for a platform so it can be re-ingested from scratch."""
+    """Wipe every stored profile for a platform so it can be re-ingested from
+    scratch. Also clears the persisted scaler/cluster-centroid state for that
+    platform — a wiped-and-reingested population should get a fresh baseline
+    rather than being scaled against a scaler fit on data that no longer exists."""
     model = PLATFORM_MODELS.get(platform, TwitterProfile)
     count = db.query(model).delete()
     db.commit()
+    clear_persisted_models(platform)
     return JSONResponse({
         'ok': True,
         'message': f'Successfully wiped {count} {platform} profiles. Table is now empty.',

@@ -10,12 +10,13 @@ add a key later.
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from typing import Any
 
 from sqlalchemy.orm import Session
 
-from ..models import LinkedInProfile, TwitterProfile
+from ..models import LinkedInProfile, RiskSnapshot, TwitterProfile
 from .nlp_features import (
     extract_linkedin_features,
     extract_twitter_features,
@@ -23,6 +24,19 @@ from .nlp_features import (
 )
 from .risk_engine import score_linkedin_profile, score_twitter_profile
 from .stats import compute_tweet_stats
+
+
+def _is_parseable_json(raw: Any) -> bool:
+    """True if raw is empty (nothing to parse) or valid JSON; False only on a genuine parse failure."""
+    if raw in (None, ''):
+        return True
+    if isinstance(raw, (dict, list)):
+        return True
+    try:
+        json.loads(raw)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def _to_int(v: Any) -> int:
@@ -43,15 +57,33 @@ def _to_bool(v: Any) -> bool:
     return str(v).strip().lower() in {'1', 'true', 'yes'}
 
 
-def ingest_twitter_rows(db: Session, rows: list[dict]) -> int:
+def _write_snapshot(db: Session, platform: str, identifier: str, result) -> None:
+    db.add(RiskSnapshot(
+        platform=platform,
+        profile_identifier=identifier,
+        risk_score=result.score,
+        risk_label=f'{result.tier} exposure risk',
+        risk_factors=result.factors_as_dicts(),
+    ))
+
+
+def ingest_twitter_rows(db: Session, rows: list[dict]) -> dict[str, Any]:
     """rows: raw dicts from a twitter_export-style CSV (one row per tweet)."""
     grouped: dict[str, list[dict]] = defaultdict(list)
     meta_by_handle: dict[str, str] = {}
 
+    rows_received = len(rows)
+    rows_skipped_no_handle = 0
+    tweets_missing_date = 0
+    profiles_malformed_profile_json = 0
+
     for row in rows:
         handle = (row.get('twitter_handle') or '').strip().lstrip('@')
         if not handle:
+            rows_skipped_no_handle += 1
             continue
+        if not row.get('created_at'):
+            tweets_missing_date += 1
         grouped[handle].append({
             'text': row.get('content', ''),
             'created_at': row.get('created_at', ''),
@@ -66,16 +98,19 @@ def ingest_twitter_rows(db: Session, rows: list[dict]) -> int:
 
     count = 0
     for handle, tweets in grouped.items():
+        if not _is_parseable_json(meta_by_handle.get(handle)):
+            profiles_malformed_profile_json += 1
         stats = compute_tweet_stats(tweets)
         profile_meta = unpack_twitter_profile_meta(meta_by_handle.get(handle))
         features, inference_rows = extract_twitter_features(tweets, profile_meta)
         result = score_twitter_profile(features)
+        _write_snapshot(db, 'twitter', handle, result)
 
         defaults = {
             'username': handle,
             **stats,
             'risk_score': result.score,
-            'risk_label': f'{result.tier} risk — local rule engine ({result.confidence:.0%} confidence)',
+            'risk_label': f'{result.tier} exposure risk — local rule engine ({result.confidence:.0%} confidence)',
             'risk_factors': result.factors_as_dicts(),
             'inference_rows': inference_rows,
             'has_email': features['has_email'],
@@ -97,19 +132,38 @@ def ingest_twitter_rows(db: Session, rows: list[dict]) -> int:
         count += 1
 
     db.commit()
-    return count
+    return {
+        'ingested': count,
+        'rows_received': rows_received,
+        'unique_profiles_found': len(grouped),
+        'rows_skipped_no_handle': rows_skipped_no_handle,
+        'tweets_missing_date': tweets_missing_date,
+        'profiles_with_malformed_profile_json': profiles_malformed_profile_json,
+    }
 
 
-def ingest_linkedin_rows(db: Session, rows: list[dict]) -> int:
+def ingest_linkedin_rows(db: Session, rows: list[dict]) -> dict[str, Any]:
     """rows: raw dicts from a linkedin_export-style CSV (one row per person)."""
     count = 0
+    rows_received = len(rows)
+    rows_skipped_no_identifier = 0
+    profiles_malformed_experiences_json = 0
+    profiles_malformed_educations_json = 0
+
     for row in rows:
         pub_id = (row.get('public_identifier') or '').strip()
         if not pub_id:
+            rows_skipped_no_identifier += 1
             continue
+
+        if not _is_parseable_json(row.get('experiences_json')):
+            profiles_malformed_experiences_json += 1
+        if not _is_parseable_json(row.get('educations_json')):
+            profiles_malformed_educations_json += 1
 
         features, inference_rows = extract_linkedin_features(row)
         result = score_linkedin_profile(features)
+        _write_snapshot(db, 'linkedin', pub_id, result)
 
         defaults = {
             'public_identifier': pub_id,
@@ -132,7 +186,7 @@ def ingest_linkedin_rows(db: Session, rows: list[dict]) -> int:
             'is_verified': _to_bool(row.get('is_verified')),
             'source_background_score': _to_float(row.get('background_score')),
             'risk_score': result.score,
-            'risk_label': f'{result.tier} risk — local rule engine',
+            'risk_label': f'{result.tier} exposure risk — local rule engine ({result.confidence:.0%} field completeness)',
             'risk_factors': result.factors_as_dicts(),
             'inference_rows': inference_rows,
             'linkedin_raw_data': row,
@@ -147,4 +201,10 @@ def ingest_linkedin_rows(db: Session, rows: list[dict]) -> int:
         count += 1
 
     db.commit()
-    return count
+    return {
+        'ingested': count,
+        'rows_received': rows_received,
+        'rows_skipped_no_identifier': rows_skipped_no_identifier,
+        'profiles_with_malformed_experiences_json': profiles_malformed_experiences_json,
+        'profiles_with_malformed_educations_json': profiles_malformed_educations_json,
+    }

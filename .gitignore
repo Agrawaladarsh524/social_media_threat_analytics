@@ -7,6 +7,9 @@ __pycache__/
 *.sqlite3
 *.log
 
+# Persisted ML artifacts (scaler/cluster-centroid state) — regenerated on ingestion
+backend/models/
+
 # OS / editor
 .DS_Store
 Thumbs.db

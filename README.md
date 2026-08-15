@@ -6,7 +6,7 @@
 
 Ingest a Twitter/X or LinkedIn export, run it through a deterministic rule-based
 risk engine plus local NLP (spaCy NER) and unsupervised ML (Isolation Forest,
-KMeans), and get back an itemized 0-100 risk score, extracted PII signals,
+KMeans), and get back an itemized 0-100 exposure risk score, extracted PII signals,
 anomaly flags, and behavioral clusters — all visualized in an interactive
 dashboard. Every point in every score is traceable to a specific, auditable
 signal — not a black-box LLM guess.
@@ -46,16 +46,29 @@ core pipeline depends on it.
 - 🧮 **Explainable risk engine** — a transparent, weighted scoring system (PII
   exposure, behavioral predictability, content/status sensitivity, exposure
   reach) with every point itemized and traceable to a real signal.
+- 🎯 **Confidence-weighted, not just averaged** — both platforms dampen their
+  predictability component by how much real data actually backs it (tweet
+  count on Twitter, populated career fields on LinkedIn), so a single data
+  point can never masquerade as a proven behavioral pattern.
 - 🕵️ **Local NLP extraction** — spaCy NER pulls real locations, organizations,
-  and PII-adjacent entities out of tweet text, bios, and LinkedIn headlines —
-  no LLM call involved.
+  and PII-adjacent entities out of tweet text, bios, and LinkedIn headlines;
+  a local sentence-embedding model (`all-MiniLM-L6-v2`) separately catches
+  near-term/specific disclosures a keyword list can't — e.g. "flying home
+  tomorrow" vs. "visited my parents last year." No LLM call involved either way.
 - 🚨 **Unsupervised anomaly & persona detection** — Isolation Forest flags
   statistically anomalous accounts; KMeans clusters profiles into behavioral
-  personas. Both fit fresh on your data, no labeled training set required.
+  personas. Cluster identity is preserved across refits (a persisted scaler
+  plus centroid remapping), so a persona's ID doesn't drift just because the
+  model was refit — see `ml_models.py`.
+- 🕰️ **Real audit trail, not a synthetic timeline** — every scoring event is
+  appended to `risk_snapshots`, so re-ingesting after a methodology change
+  produces genuine before/after history instead of a fabricated backfill.
 - 🌐 **Two independent OSINT sources, one platform** — Twitter/X (engagement,
   posting patterns, tweet content) and LinkedIn (disclosed location, employer
   history, job-seeking status) share one scoring architecture via pluggable
   feature extractors.
+- 🧹 **Data-quality visibility** — every ingestion reports rows skipped,
+  malformed JSON fields, and missing dates, instead of silently zeroing them out.
 - 📊 **Interactive, purposeful analytics** — every chart reflects a real
   computed signal (risk distribution, anomaly scores, cluster sizes, top
   disclosed locations) instead of a static placeholder.
@@ -69,11 +82,12 @@ core pipeline depends on it.
 flowchart LR
     CSV[Twitter/X or LinkedIn\nCSV export] --> ING[Local ingestion pipeline]
     ING --> STATS[stats.py\nreal engagement metrics]
-    ING --> NER[nlp_features.py\nspaCy NER + keyword rules]
-    STATS --> ENGINE[risk_engine.py\nweighted rule-based scorer]
+    ING --> NER[nlp_features.py\nspaCy NER + keywords + semantic exemplar similarity]
+    STATS --> ENGINE[risk_engine.py\nconfidence-weighted rule-based scorer]
     NER --> ENGINE
     ENGINE --> DB[(SQLite / Postgres)]
-    DB --> ML[ml_models.py\nIsolation Forest + KMeans]
+    ENGINE --> SNAP[risk_snapshots\nappend-only audit trail]
+    DB --> ML[ml_models.py\nIsolation Forest + KMeans\npersisted scaler, centroid-remapped]
     ML --> DB
     DB --> API[FastAPI service]
     API --> ST[Streamlit dashboard]
@@ -93,15 +107,17 @@ of truth for stored profiles and the only component holding credentials.
 
 | Layer | Technology | Role |
 | --- | --- | --- |
-| UI | **Streamlit** + **Plotly** | Interactive dashboard — lookup, ingestion, analytics, model insights, profile browser |
+| UI | **Streamlit** + **Plotly** | Interactive dashboard — lookup, ingestion, analytics, model insights, profile browser. Native widgets only (`st.metric` with sparklines, bordered containers, `column_config` progress columns, Material icons); no HTML/CSS/JS is authored anywhere |
 | API | **FastAPI** + **Uvicorn** | Async REST API, request validation, routing |
 | Local NLP | **spaCy** (`en_core_web_sm`) | Named-entity recognition for PII/location extraction — no external calls |
-| Unsupervised ML | **scikit-learn** (Isolation Forest, KMeans) | Anomaly detection + behavioral clustering, fit fresh on each ingestion |
-| Risk scoring | Custom weighted engine (`risk_engine.py`) | Deterministic, itemized 0-100 score — no training data needed |
+| Semantic content scoring | **sentence-transformers** (`all-MiniLM-L6-v2`) | CPU-only exemplar-similarity scoring — catches near-term disclosures a keyword list can't, no training loop, no labeled dataset |
+| Unsupervised ML | **scikit-learn** (Isolation Forest, KMeans) | Anomaly detection + behavioral clustering; `scipy` (optimal assignment) matches new cluster centroids back to the previous run's so persona identity survives a refit |
+| Model persistence | **joblib** | Persists the fitted `StandardScaler` and cluster centroids under `backend/models/` (gitignored, regenerated on ingestion) |
+| Risk scoring | Custom weighted engine (`risk_engine.py`) | Deterministic, itemized 0-100 score, confidence-weighted by data volume — no training data needed |
 | Data wrangling | **pandas**, **numpy** | Feature engineering across both platforms |
-| Validation & config | **Pydantic v2**, `pydantic-settings` | Typed request models, `.env`-driven settings |
-| Persistence | **SQLAlchemy 2.0** | ORM over SQLite (default) or any SQL database via `DATABASE_URL` |
-| Testing | **pytest** | Unit tests for the risk engine and NLP extractors, FastAPI `TestClient` route tests |
+| Validation & config | **Pydantic v2**, `pydantic-settings` | Typed request models, `.env`-driven settings, environment-forced production safety |
+| Persistence | **SQLAlchemy 2.0** | ORM over SQLite (default) or any SQL database via `DATABASE_URL`; includes an append-only `risk_snapshots` audit table |
+| Testing | **pytest** | Unit tests for the risk engine, NLP extractors, and ML layer; FastAPI `TestClient` route tests against an isolated temp DB |
 | *Optional* | **OpenAI API**, **Apify** client | Live scraping + LLM-generated summaries, behind an explicit opt-in — not required |
 
 ## Project Structure
@@ -113,25 +129,26 @@ osint-guard/
 │   │   ├── main.py                 App factory, CORS, startup table creation
 │   │   ├── config.py               Settings loaded from .env
 │   │   ├── database.py             SQLAlchemy engine / session / declarative base
-│   │   ├── models.py               TwitterProfile + LinkedInProfile ORM models
+│   │   ├── models.py               TwitterProfile + LinkedInProfile + RiskSnapshot ORM models
 │   │   ├── schemas.py              Pydantic request models
 │   │   ├── routes.py               All /api/* endpoints
 │   │   └── services/
-│   │       ├── risk_engine.py      Platform-agnostic weighted risk-scoring core
-│   │       ├── nlp_features.py     spaCy NER + regex + feature extraction (Twitter & LinkedIn)
-│   │       ├── ml_models.py        Isolation Forest (anomaly) + KMeans (clustering)
-│   │       ├── local_ingest.py     CSV -> features -> score -> persist, no API key
+│   │       ├── risk_engine.py      Platform-agnostic, confidence-weighted risk-scoring core
+│   │       ├── nlp_features.py     spaCy NER + keywords + sentence-embedding exemplar similarity
+│   │       ├── ml_models.py        Isolation Forest + KMeans, persisted scaler + centroid remapping
+│   │       ├── local_ingest.py     CSV -> features -> score -> persist + snapshot, no API key
 │   │       ├── stats.py            Deterministic tweet-engagement metrics
 │   │       ├── analytics.py        Seaborn/matplotlib chart export (PNG)
 │   │       ├── apify_collect.py    Optional: Apify actor runs → normalized tweets
 │   │       └── openai_insights.py  Optional: chained OpenAI calls → LLM risk bundle
-│   ├── tests/                      pytest suite (risk engine, NLP, routes)
+│   ├── models/                     Persisted scaler/centroid artifacts (gitignored, regenerated)
+│   ├── tests/                      pytest suite (risk engine, NLP, ML layer, routes)
 │   ├── requirements.txt
 │   └── .env.example
 │
 └── frontend/                       Streamlit UI
     ├── streamlit_app.py            Target Lookup · Bulk Ingestion · Analytics · Model Insights · Database
-    ├── .streamlit/config.toml      Native theme (no custom HTML/CSS)
+    ├── .streamlit/config.toml      Native theme config (no custom HTML/CSS)
     └── requirements.txt
 ```
 
@@ -154,7 +171,10 @@ uvicorn app.main:app --reload             # http://127.0.0.1:8000
 ```
 
 Database tables are created automatically on first run. Interactive API docs
-are served at `/docs` (Swagger) and `/redoc`.
+are served at `/docs` (Swagger) and `/redoc`. The semantic-scoring model
+(`all-MiniLM-L6-v2`, ~90MB) downloads automatically from Hugging Face the
+first time `/api/ingest-local/` runs — no separate command needed, but that
+first ingestion needs internet access; every run after that is fully offline.
 
 ### 2. Frontend
 
@@ -182,7 +202,8 @@ you're using the optional live-scrape/LLM path**; the local pipeline needs none 
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `DEBUG` | `true` | Enables permissive CORS for local dev; set `false` in production |
+| `ENVIRONMENT` | `development` | Set to `production` to **force** `DEBUG=false` regardless of the `DEBUG` value below, so permissive CORS/tracebacks can't ship to a real deployment by accident |
+| `DEBUG` | `true` | Enables permissive CORS and detailed error tracebacks for local dev; set `false` in production |
 | `CORS_ALLOWED_ORIGINS` | `["http://localhost:8501", ...]` | Browser origins allowed to call the API when `DEBUG=false` |
 | `DATABASE_URL` | SQLite file in `backend/` | Any SQLAlchemy-compatible connection string (Postgres, MySQL, etc.) |
 | `APIFY_API_TOKEN` | *(empty)* | Optional — required only for live Twitter/X scraping |
@@ -198,11 +219,12 @@ you're using the optional live-scrape/LLM path**; the local pipeline needs none 
 | --- | --- | --- |
 | `GET` | `/api/health/` | Liveness probe |
 | `POST` | `/api/ingest-local/` | **Primary path.** CSV -> local risk engine, per platform (`twitter` \| `linkedin`), no API key |
-| `POST` | `/api/recompute-models/` | Refit Isolation Forest + KMeans across all stored profiles for a platform |
+| `POST` | `/api/recompute-models/` | Refit Isolation Forest + KMeans for a platform. Cluster IDs are matched back to the previous run's by default; pass `force_retrain=true` to reset that |
 | `GET` | `/api/profiles-summary/` | Uncapped, lightweight profile list for client-side charting |
 | `GET` | `/api/analytics/` | Render static PNG charts (matplotlib/seaborn export) |
 | `GET` | `/api/check-db/` | Fetch the 50 most recently scanned profiles |
 | `GET` | `/api/profile-detail/{platform}/{identifier}/` | Full itemized risk-factor breakdown for one profile |
+| `GET` | `/api/snapshots/{platform}/{identifier}/` | Every past scoring event for one profile, oldest first — the real (non-synthetic) audit trail |
 | `GET` | `/api/usernames/` | List every stored handle/identifier for a platform |
 | `GET / POST / DELETE` | `/api/clear-db/` | Wipe stored profiles for a platform |
 | `POST` | `/api/collect/` | *Optional.* Scrape a handle's public tweets via Apify |
@@ -214,23 +236,28 @@ Full request/response schemas: `http://127.0.0.1:8000/docs`
 
 ## Usage
 
-The dashboard is organized into five tabs, with a platform switcher (Twitter/X
-vs. LinkedIn) at the top that scopes everything below it:
+A persistent KPI header (population, mean exposure with a distribution
+sparkline, high/critical count, anomaly flags) sits above five tabs. The
+sidebar platform switcher (Twitter/X vs. LinkedIn) scopes every tab:
 
-1. **Target Lookup** — look up an already-ingested profile and see its full
-   itemized risk breakdown. An optional "Advanced" section exposes the live
-   Apify + OpenAI scan for users who've added those keys.
-2. **Bulk Ingestion** — upload a CSV export and ingest it through the local
-   pipeline in one click. The OpenAI-scored path is available as a collapsed,
-   optional alternative.
-3. **Analytics** — interactive Plotly charts (risk distribution, anomaly
-   scores, cluster sizes, top disclosed locations, engagement) built from the
-   local pipeline's output, plus a static-PNG export option.
-4. **Model Insights** — Isolation Forest / KMeans diagnostics (silhouette
-   score, flagged anomalies, cluster profiles) and a plain-language
-   explanation of exactly how the risk score is computed.
+1. **Target Lookup** — look up an ingested profile and see its itemized
+   exposure breakdown: points-per-bucket chart, a signal table with inline
+   progress bars and the source evidence for each point, extracted entities,
+   and a score-history chart if it's been re-ingested more than once. An
+   optional "Advanced" section exposes the live Apify + OpenAI scan.
+2. **Bulk Ingestion** — upload a CSV and ingest it through the local pipeline
+   in one click, with live pipeline status, a data-quality panel (rows
+   skipped, malformed fields), and model-refit diagnostics after every run.
+   The OpenAI-scored path stays available as a collapsed alternative.
+3. **Analytics** — interactive Plotly charts grouped by question: exposure
+   distribution, highest-exposure profiles, reach/behavior, disclosed PII
+   (LinkedIn), and the unsupervised layer. Static PNG export for slides.
+4. **Model Insights** — Isolation Forest / KMeans diagnostics (selected k and
+   why, silhouette, flagged anomalies, cluster composition), a cluster-identity
+   indicator, an optional force-fresh-baseline refit, and a plain-language
+   explanation of exactly how the exposure risk score is computed.
 5. **Database** — browse, inspect, export (CSV), or clear stored profiles per
-   platform.
+   platform, with the full risk-factor breakdown for any selected profile.
 
 ## Testing
 
@@ -240,20 +267,40 @@ pip install -r requirements.txt   # includes pytest
 pytest tests/ -v
 ```
 
-Covers the risk engine (score bounds, tier ordering, sample-size confidence
-weighting), the NLP feature extractors (entity extraction, keyword matching),
-and the ingestion/analytics routes end to end via FastAPI's `TestClient`
-against an isolated temp database.
+Covers the risk engine (score bounds, tier ordering, confidence weighting on
+both platforms), the NLP feature extractors (entity extraction, keyword
+matching), the unsupervised ML layer (outlier detection, k-selection,
+cluster-identity stability across independent refits), and the
+ingestion/analytics routes end to end via FastAPI's `TestClient` against an
+isolated temp database.
+
+## Deliberately Not Built
+
+A few extensions were evaluated and specifically decided against, not just
+deprioritized — worth stating explicitly rather than leaving as a silent gap:
+
+- **A supervised "learned" risk model.** There is no labeled ground truth
+  anywhere in this project — nobody has verified which real profiles were
+  actually targeted or victimized. Training a model would mean inventing
+  the labels myself, which doesn't produce a more trustworthy score, it just
+  adds ML tooling around an assumption. This is the same credibility problem
+  that motivated moving off the original LLM-based score in the first place.
+- **Cross-platform identity resolution.** Checked directly: the Twitter/X and
+  LinkedIn datasets used here have zero real name overlap. A matcher built
+  against them would demo an empty result every time — architecture aimed at
+  data that doesn't exist yet, not a real capability.
+- **Data/model drift monitoring.** Meaningful drift detection compares a live
+  population against a fixed training distribution. Isolation Forest and
+  KMeans here refit fresh every call by design, so there's no fixed baseline
+  to drift away from — instrumentation with nothing real to measure.
 
 ## Roadmap
 
-- [ ] Supervised distillation model (RandomForestRegressor trained on the
-      rule engine's own output) with SHAP-based feature importance
 - [ ] Containerization (Dockerfile + docker-compose for both services)
 - [ ] Authentication / role-based access for multi-analyst deployments
 - [ ] CI pipeline (lint, type-check, test on push)
-- [ ] Cross-platform identity resolution (linking the same person across
-      Twitter and LinkedIn when both are present)
+- [ ] `st.navigation`/`st.Page` multipage restructuring (polish only — the
+      current tab-based layout is functionally complete)
 
 ## Contributing
 
