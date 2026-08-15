@@ -1,3 +1,4 @@
+<!-- markdownlint-disable MD033 MD041 -->
 <div align="center">
 
 # OSINT-Guard
@@ -19,6 +20,7 @@ signal — not a black-box LLM guess.
 [![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-2.0-D71F00)](https://www.sqlalchemy.org/)
 
 </div>
+<!-- markdownlint-enable MD033 MD041 -->
 
 ---
 
