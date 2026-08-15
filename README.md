@@ -79,7 +79,7 @@ flowchart LR
     API --> ST[Streamlit dashboard]
     U([Analyst]) --> ST
 
-    subgraph Optional, not required
+    subgraph "Optional, not required"
       APIFY[Apify scraper] -.-> API
       OAI[OpenAI LLM] -.-> API
     end
