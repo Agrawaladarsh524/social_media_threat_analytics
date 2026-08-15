@@ -8,3 +8,14 @@ apify-client>=1.7,<2
 openai>=1.30,<2
 matplotlib>=3.9,<4
 seaborn>=0.13,<1
+
+# Local intelligence pipeline (risk_engine / nlp_features / ml_models) — no API key needed
+pandas>=2.2,<3
+numpy>=1.26,<3
+scikit-learn>=1.4,<2
+spacy>=3.7,<4
+# One-time model download after installing requirements:
+#   python -m spacy download en_core_web_sm
+
+# Dev/test only
+pytest>=8.0,<10

@@ -9,21 +9,25 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, Form, UploadFile
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .config import settings
 from .database import get_db
-from .models import TwitterProfile
+from .models import LinkedInProfile, TwitterProfile
 from .schemas import CollectRequest, InsightsRequest
 from .services.analytics import build_charts
 from .services.apify_collect import collect_osint
+from .services.local_ingest import ingest_linkedin_rows, ingest_twitter_rows
+from .services.ml_models import linkedin_ml_features, run_anomaly_and_clusters, twitter_ml_features
 from .services.openai_insights import generate_ai_bundle
 from .services.stats import build_profile_defaults
 
 router = APIRouter()
+
+PLATFORM_MODELS = {'twitter': TwitterProfile, 'linkedin': LinkedInProfile}
 
 
 def _fmt(dt: datetime | None) -> str | None:
@@ -179,60 +183,225 @@ async def upload_bulk(
     })
 
 
+@router.post('/ingest-local/')
+async def ingest_local(
+    file: UploadFile = File(...),
+    platform: str = Form(...),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    """
+    CSV ingestion through the fully local pipeline: real stats + spaCy NER +
+    deterministic rule-based risk scoring. No OpenAI key required.
+    `platform` must be 'twitter' or 'linkedin'.
+    """
+    if platform not in PLATFORM_MODELS:
+        return JSONResponse({'ok': False, 'error': "platform must be 'twitter' or 'linkedin'"}, status_code=400)
+
+    raw = await file.read()
+    try:
+        content = raw.decode('utf-8-sig')
+        rows = list(csv.DictReader(io.StringIO(content)))
+    except Exception as e:  # noqa: BLE001 — surface parse errors to the client
+        return JSONResponse({'ok': False, 'error': f'Invalid CSV: {e}'}, status_code=400)
+
+    if not rows:
+        return JSONResponse({'ok': False, 'error': 'CSV has no rows.'}, status_code=400)
+
+    if platform == 'twitter':
+        count = ingest_twitter_rows(db, rows)
+    else:
+        count = ingest_linkedin_rows(db, rows)
+
+    return JSONResponse({
+        'ok': True,
+        'platform': platform,
+        'profiles_ingested': count,
+        'message': f'{count} {platform} profile(s) ingested via the local rule-based/NER pipeline (no AI key used).',
+    })
+
+
+@router.post('/recompute-models/')
+def recompute_models(platform: str = 'twitter', db: Session = Depends(get_db)) -> JSONResponse:
+    """Refit Isolation Forest (anomaly) + KMeans (clustering) across every
+    stored profile for a platform, and persist the results."""
+    if platform not in PLATFORM_MODELS:
+        return JSONResponse({'ok': False, 'error': "platform must be 'twitter' or 'linkedin'"}, status_code=400)
+
+    model = PLATFORM_MODELS[platform]
+    feature_fn = twitter_ml_features if platform == 'twitter' else linkedin_ml_features
+    profiles = list(db.scalars(select(model)))
+
+    anomaly_by_id, cluster_by_id, diagnostics = run_anomaly_and_clusters(profiles, feature_fn)
+    for p in profiles:
+        p.anomaly_score = anomaly_by_id.get(p.id)
+        p.cluster_id = cluster_by_id.get(p.id)
+    db.commit()
+
+    return JSONResponse({'ok': True, 'platform': platform, 'diagnostics': diagnostics})
+
+
+@router.get('/profiles-summary/')
+def profiles_summary(platform: str = 'twitter', db: Session = Depends(get_db)) -> JSONResponse:
+    """Lightweight, uncapped list of numeric/risk fields for every stored
+    profile on a platform — used by the frontend to build interactive
+    charts client-side (Plotly) without pulling heavy JSON blob columns."""
+    if platform == 'linkedin':
+        rows = list(db.scalars(select(LinkedInProfile)))
+        data = [
+            {
+                'username': p.public_identifier,
+                'full_name': p.full_name,
+                'risk_score': p.risk_score,
+                'risk_label': p.risk_label,
+                'anomaly_score': p.anomaly_score,
+                'cluster_id': p.cluster_id,
+                'location_city': p.location_city,
+                'location_state': p.location_state,
+                'location_country': p.location_country,
+                'current_employer': p.current_employer,
+                'employer_count': p.employer_count,
+                'connections_count': p.connections_count,
+                'follower_count': p.follower_count,
+                'open_to_work': p.open_to_work,
+                'is_hiring': p.is_hiring,
+            }
+            for p in rows
+        ]
+    else:
+        rows = list(db.scalars(select(TwitterProfile)))
+        data = [
+            {
+                'username': p.username,
+                'risk_score': p.risk_score,
+                'risk_label': p.risk_label,
+                'anomaly_score': p.anomaly_score,
+                'cluster_id': p.cluster_id,
+                'total_tweets': p.total_tweets,
+                'total_likes': p.total_likes,
+                'total_views': p.total_views,
+                'avg_engagement': p.avg_engagement,
+                'followers_count': p.followers_count,
+                'categories': p.categories,
+            }
+            for p in rows
+        ]
+    return JSONResponse({'ok': True, 'platform': platform, 'total': len(data), 'profiles': data})
+
+
 @router.get('/analytics/')
-def analytics(db: Session = Depends(get_db)) -> JSONResponse:
-    profiles = list(db.scalars(select(TwitterProfile)))
-    return JSONResponse(build_charts(profiles))
+def analytics(platform: str = 'twitter', db: Session = Depends(get_db)) -> JSONResponse:
+    model = PLATFORM_MODELS.get(platform, TwitterProfile)
+    profiles = list(db.scalars(select(model)))
+    return JSONResponse(build_charts(profiles, platform=platform))
 
 
 @router.get('/check-db/')
-def check_db(db: Session = Depends(get_db)) -> JSONResponse:
-    """Real data + AI risk signals for the 50 most recent profiles. No AI prose."""
+def check_db(platform: str = 'twitter', db: Session = Depends(get_db)) -> JSONResponse:
+    """Real data + local risk-engine output for the 50 most recent profiles."""
+    model = PLATFORM_MODELS.get(platform, TwitterProfile)
     profiles = list(
-        db.scalars(select(TwitterProfile).order_by(TwitterProfile.scanned_at.desc()).limit(50))
+        db.scalars(select(model).order_by(model.scanned_at.desc()).limit(50))
     )
-    total = db.scalar(select(func.count()).select_from(TwitterProfile)) or 0
+    total = db.scalar(select(func.count()).select_from(model)) or 0
 
-    data = [
-        {
-            'username': p.username,
-            'scanned_at': _fmt(p.scanned_at),
-            'bundle_generated_at': _fmt(p.bundle_generated_at),
-            'risk_score': p.risk_score,
-            'risk_label': p.risk_label,
-            'tweet_stats': {
-                'total_tweets':   p.total_tweets,
-                'date_first':     p.date_first_tweet,
-                'date_last':      p.date_last_tweet,
-                'categories':     p.categories,
-                'total_likes':    p.total_likes,
-                'total_retweets': p.total_retweets,
-                'total_replies':  p.total_replies,
-                'total_quotes':   p.total_quotes,
-                'total_views':    p.total_views,
-                'avg_engagement': p.avg_engagement,
-            },
-            'risk_signals': p.inference_rows,
-            'pattern_of_life': p.pattern_of_life,
-        }
-        for p in profiles
-    ]
+    if platform == 'linkedin':
+        data = [
+            {
+                'username': p.public_identifier,
+                'full_name': p.full_name,
+                'scanned_at': _fmt(p.scanned_at),
+                'risk_score': p.risk_score,
+                'risk_label': p.risk_label,
+                'anomaly_score': p.anomaly_score,
+                'cluster_id': p.cluster_id,
+                'tweet_stats': {
+                    'headline': p.headline,
+                    'location': ', '.join(x for x in [p.location_city, p.location_state, p.location_country] if x),
+                    'current_employer': p.current_employer,
+                    'employer_count': p.employer_count,
+                    'connections_count': p.connections_count,
+                    'follower_count': p.follower_count,
+                    'open_to_work': p.open_to_work,
+                    'is_hiring': p.is_hiring,
+                },
+                'risk_signals': p.inference_rows,
+                'pattern_of_life': [],
+            }
+            for p in profiles
+        ]
+    else:
+        data = [
+            {
+                'username': p.username,
+                'scanned_at': _fmt(p.scanned_at),
+                'bundle_generated_at': _fmt(p.bundle_generated_at),
+                'risk_score': p.risk_score,
+                'risk_label': p.risk_label,
+                'anomaly_score': p.anomaly_score,
+                'cluster_id': p.cluster_id,
+                'tweet_stats': {
+                    'total_tweets':   p.total_tweets,
+                    'date_first':     p.date_first_tweet,
+                    'date_last':      p.date_last_tweet,
+                    'categories':     p.categories,
+                    'total_likes':    p.total_likes,
+                    'total_retweets': p.total_retweets,
+                    'total_replies':  p.total_replies,
+                    'total_quotes':   p.total_quotes,
+                    'total_views':    p.total_views,
+                    'avg_engagement': p.avg_engagement,
+                },
+                'risk_signals': p.inference_rows,
+                'pattern_of_life': p.pattern_of_life,
+            }
+            for p in profiles
+        ]
     return JSONResponse({'total_db_records': total, 'profiles': data})
 
 
+@router.get('/profile-detail/{platform}/{identifier}/')
+def profile_detail(platform: str, identifier: str, db: Session = Depends(get_db)) -> JSONResponse:
+    """Full risk_factors breakdown for one profile — the 'why this score' view."""
+    model = PLATFORM_MODELS.get(platform)
+    if model is None:
+        return JSONResponse({'ok': False, 'error': "platform must be 'twitter' or 'linkedin'"}, status_code=400)
+
+    key_col = model.username if platform == 'twitter' else model.public_identifier
+    profile = db.scalar(select(model).where(key_col.ilike(identifier)))
+    if not profile:
+        return JSONResponse({'ok': False, 'error': 'Profile not found in database.'})
+
+    return JSONResponse({
+        'ok': True,
+        'profile': {
+            'identifier': identifier,
+            'risk_score': profile.risk_score,
+            'risk_label': profile.risk_label,
+            'risk_factors': profile.risk_factors,
+            'anomaly_score': profile.anomaly_score,
+            'cluster_id': profile.cluster_id,
+            'inference_rows': profile.inference_rows or [],
+        },
+    })
+
+
 @router.api_route('/clear-db/', methods=['GET', 'POST', 'DELETE'])
-def clear_db(db: Session = Depends(get_db)) -> JSONResponse:
-    """Wipe every stored profile so a dataset can be re-ingested from scratch."""
-    count = db.query(TwitterProfile).delete()
+def clear_db(platform: str = 'twitter', db: Session = Depends(get_db)) -> JSONResponse:
+    """Wipe every stored profile for a platform so it can be re-ingested from scratch."""
+    model = PLATFORM_MODELS.get(platform, TwitterProfile)
+    count = db.query(model).delete()
     db.commit()
     return JSONResponse({
         'ok': True,
-        'message': f'Successfully wiped {count} profiles. Database is now completely empty.',
+        'message': f'Successfully wiped {count} {platform} profiles. Table is now empty.',
     })
 
 
 @router.get('/profile/{username}/')
 def get_profile(username: str, db: Session = Depends(get_db)) -> JSONResponse:
+    """Twitter-only quick lookup, kept for backward compatibility with the
+    Target Scan tab. Use /api/profile-detail/{platform}/{identifier}/ for
+    the full risk-factors breakdown on either platform."""
     profile = db.scalar(
         select(TwitterProfile).where(TwitterProfile.username.ilike(username))
     )
@@ -254,5 +423,7 @@ def get_profile(username: str, db: Session = Depends(get_db)) -> JSONResponse:
 
 
 @router.get('/usernames/')
-def usernames(db: Session = Depends(get_db)) -> JSONResponse:
+def usernames(platform: str = 'twitter', db: Session = Depends(get_db)) -> JSONResponse:
+    if platform == 'linkedin':
+        return JSONResponse({'ok': True, 'usernames': list(db.scalars(select(LinkedInProfile.public_identifier)))})
     return JSONResponse({'ok': True, 'usernames': list(db.scalars(select(TwitterProfile.username)))})

@@ -37,11 +37,23 @@ class TwitterProfile(Base):
     total_views: Mapped[int] = mapped_column(Integer, default=0)
     avg_engagement: Mapped[float] = mapped_column(Float, default=0.0)
 
-    # --- AI risk decision (score + what signals drove it) ---
+    # --- Risk decision (score + what signals drove it) ---
     risk_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     risk_label: Mapped[str] = mapped_column(String(255), default='')
     inference_rows: Mapped[list[Any]] = mapped_column(JSON, default=list)
     pattern_of_life: Mapped[list[Any]] = mapped_column(JSON, default=list)
+
+    # --- Local intelligence pipeline outputs (risk_engine / nlp_features / ml_models) ---
+    has_email: Mapped[bool] = mapped_column(default=False)
+    has_linkedin: Mapped[bool] = mapped_column(default=False)
+    has_org: Mapped[bool] = mapped_column(default=False)
+    organization: Mapped[str] = mapped_column(String(255), default='')
+    followers_count: Mapped[int] = mapped_column(Integer, default=0)
+    following_count: Mapped[int] = mapped_column(Integer, default=0)
+    posting_entropy: Mapped[float] = mapped_column(Float, default=0.0)
+    risk_factors: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    anomaly_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cluster_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # --- Full AI bundle + raw tweet data ---
     ai_bundle: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -55,3 +67,55 @@ class TwitterProfile(Base):
 
     def __repr__(self) -> str:
         return f'<TwitterProfile @{self.username} (Risk: {self.risk_score})>'
+
+
+class LinkedInProfile(Base):
+    """
+    Stores LinkedIn OSINT profiles, scored by the same local risk engine as
+    TwitterProfile but through a LinkedIn-specific feature extractor.
+    """
+
+    __tablename__ = 'linkedin_profiles'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    public_identifier: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    full_name: Mapped[str] = mapped_column(String(255), default='')
+    headline: Mapped[str] = mapped_column(String(500), default='')
+    about: Mapped[str] = mapped_column(String(2000), default='')
+
+    # --- Disclosed identity / location (real data, no inference) ---
+    location_city: Mapped[str] = mapped_column(String(255), default='')
+    location_state: Mapped[str] = mapped_column(String(255), default='')
+    location_country: Mapped[str] = mapped_column(String(255), default='')
+    current_employer: Mapped[str] = mapped_column(String(255), default='')
+    employer_count: Mapped[int] = mapped_column(Integer, default=0)
+    education_disclosed: Mapped[bool] = mapped_column(default=False)
+    skill_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    # --- Reach / status flags ---
+    connections_count: Mapped[int] = mapped_column(Integer, default=0)
+    follower_count: Mapped[int] = mapped_column(Integer, default=0)
+    open_to_work: Mapped[bool] = mapped_column(default=False)
+    is_hiring: Mapped[bool] = mapped_column(default=False)
+    is_premium: Mapped[bool] = mapped_column(default=False)
+    is_influencer: Mapped[bool] = mapped_column(default=False)
+    is_verified: Mapped[bool] = mapped_column(default=False)
+
+    # --- Source-provided score (never reinterpreted as our own) ---
+    source_background_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # --- Local intelligence pipeline outputs (shared shape with TwitterProfile) ---
+    risk_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    risk_label: Mapped[str] = mapped_column(String(255), default='')
+    risk_factors: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    inference_rows: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    anomaly_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cluster_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # --- Raw source row ---
+    linkedin_raw_data: Mapped[Any] = mapped_column(JSON, default=dict)
+
+    scanned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    def __repr__(self) -> str:
+        return f'<LinkedInProfile @{self.public_identifier} (Risk: {self.risk_score})>'
