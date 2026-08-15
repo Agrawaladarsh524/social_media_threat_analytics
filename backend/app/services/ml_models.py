@@ -20,6 +20,8 @@ methodology change, or a `clear-db` wipe) and get a fresh baseline.
 
 from __future__ import annotations
 
+import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +39,54 @@ MIN_CLUSTER_SIZE = 3  # reject a k if it produces a cluster smaller than this
 
 MODEL_DIR = Path(__file__).resolve().parent.parent.parent / 'models'
 
+# Feature schemas, declared explicitly so a persisted scaler can be checked
+# against the extractor that will feed it. Order is significant: StandardScaler
+# stores per-column mean/scale, so reusing an artifact after the extractor's
+# columns are reordered or redefined applies the wrong statistics to every
+# column. scikit-learn raises on a feature-COUNT mismatch but is silent on a
+# same-count reorder — measured effect of that silent case on a fixed dataset
+# was silhouette 0.576 / k=5 against a correct 0.311 / k=2. Bumping these lists
+# (rename, reorder, add, remove) changes the fingerprint and forces a refit.
+TWITTER_FEATURE_NAMES = [
+    'log1p_followers',
+    'followers_per_following',
+    'avg_engagement',
+    'likes_per_tweet',
+]
+LINKEDIN_FEATURE_NAMES = [
+    'log1p_connections',
+    'followers_per_connection',
+    'employer_count',
+    'status_flag_count',
+]
+FEATURE_NAMES = {'twitter': TWITTER_FEATURE_NAMES, 'linkedin': LINKEDIN_FEATURE_NAMES}
+
+
+def schema_fingerprint(feature_names: list[str], feature_fn=None) -> str:
+    """
+    Short hash identifying the feature schema a scaler was fit against.
+
+    Hashing the declared names alone is not enough: the first version of this
+    guard did exactly that, and a test where only the extractor's column
+    ORDER changed still slipped through (names unchanged -> fingerprint
+    unchanged -> stale scaler reused -> silhouette 0.576/k=5 against a
+    correct 0.311/k=2). The declaration and the implementation can drift
+    apart silently.
+
+    So the extractor itself is folded in: its bytecode (catches reordering
+    and any logic change) plus the attribute names it reads (catches
+    swapping one profile field for another). A Python version bump changes
+    bytecode and causes one spurious refit, which is harmless — the failure
+    direction is "refit unnecessarily", never "reuse a wrong scaler".
+    """
+    parts = ['|'.join(feature_names)]
+    if feature_fn is not None:
+        code = getattr(feature_fn, '__code__', None)
+        if code is not None:
+            parts.append(code.co_code.hex())
+            parts.append(','.join(sorted(code.co_names)))
+    return hashlib.sha256('||'.join(parts).encode()).hexdigest()[:16]
+
 
 def _model_path(platform: str, name: str) -> Path:
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -52,16 +102,59 @@ def clear_persisted_models(platform: str) -> None:
             path.unlink()
 
 
-def _get_scaler(platform: str, rows: list[list[float]], force_retrain: bool) -> StandardScaler:
+def load_model_metadata(platform: str) -> dict[str, Any] | None:
+    """Provenance for the persisted scaler: which schema it was fit against,
+    when, and on how many profiles. Returns None if nothing is persisted."""
     path = _model_path(platform, 'scaler')
+    if not path.exists():
+        return None
+    try:
+        bundle = joblib.load(path)
+    except Exception:  # noqa: BLE001 — unreadable artifact is reported as absent
+        return None
+    if not isinstance(bundle, dict):
+        return None
+    return {k: v for k, v in bundle.items() if k != 'scaler'}
+
+
+def _get_scaler(
+    platform: str, rows: list[list[float]], force_retrain: bool, feature_fn=None,
+) -> tuple[StandardScaler, dict[str, Any]]:
+    """Returns (scaler, provenance). Refits whenever the persisted artifact is
+    missing, unreadable, or was fit against a different feature schema — the
+    schema check is what stops a reordered/redefined extractor from silently
+    reusing the wrong per-column statistics."""
+    path = _model_path(platform, 'scaler')
+    names = FEATURE_NAMES[platform]
+    want = schema_fingerprint(names, feature_fn)
+    refit_reason = 'forced fresh baseline' if force_retrain else None
+
     if not force_retrain and path.exists():
         try:
-            return joblib.load(path)
-        except Exception:  # noqa: BLE001 — corrupt/incompatible artifact, refit instead of hard-failing
-            pass
+            bundle = joblib.load(path)
+            if isinstance(bundle, dict) and bundle.get('schema_fingerprint') == want:
+                meta = {k: v for k, v in bundle.items() if k != 'scaler'}
+                meta['refit'] = False
+                return bundle['scaler'], meta
+            refit_reason = (
+                'feature schema changed since the persisted scaler was fit'
+                if isinstance(bundle, dict) else
+                'persisted artifact predates schema tracking'
+            )
+        except Exception:  # noqa: BLE001 — corrupt artifact, refit instead of hard-failing
+            refit_reason = 'persisted artifact unreadable'
+    elif not path.exists():
+        refit_reason = 'no persisted scaler yet'
+
     scaler = StandardScaler().fit(np.array(rows, dtype=float))
-    joblib.dump(scaler, path)
-    return scaler
+    meta = {
+        'schema_fingerprint': want,
+        'feature_names': names,
+        'trained_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        'training_population': len(rows),
+    }
+    joblib.dump({'scaler': scaler, **meta}, path)
+    return scaler, {**meta, 'refit': True, 'refit_reason': refit_reason}
 
 
 def _remap_cluster_ids(platform: str, centroids: np.ndarray, labels: np.ndarray, force_retrain: bool) -> np.ndarray:
@@ -166,7 +259,18 @@ def run_anomaly_and_clusters(
         return {}, {}, {'ok': False, 'reason': f'Need at least {MIN_PROFILES_FOR_ML} profiles, have {len(profiles)}.'}
 
     rows = [feature_fn(p) for p in profiles]
-    scaler = _get_scaler(platform, rows, force_retrain)
+    expected = len(FEATURE_NAMES[platform])
+    if rows and len(rows[0]) != expected:
+        return {}, {}, {
+            'ok': False,
+            'reason': (
+                f'Feature extractor returned {len(rows[0])} features but the declared '
+                f'{platform} schema has {expected}. Update FEATURE_NAMES in ml_models.py '
+                'so the persisted scaler is validated against the real schema.'
+            ),
+        }
+
+    scaler, model_meta = _get_scaler(platform, rows, force_retrain, feature_fn)
     X = scaler.transform(np.array(rows, dtype=float))
 
     iso = IsolationForest(contamination=contamination, random_state=42)
@@ -190,5 +294,6 @@ def run_anomaly_and_clusters(
         'contamination': contamination,
         'flagged_anomalies': int((anomaly_scaled >= 70).sum()),
         'cluster_ids_stable_across_refits': not force_retrain,
+        'model': model_meta,
     }
     return anomaly_by_id, cluster_by_id, diagnostics

@@ -651,6 +651,15 @@ with tab_insights:
     st.subheader('Model Insights')
     st.caption('Diagnostics for the unsupervised layer (Isolation Forest + KMeans), and how the exposure risk score is computed.')
 
+    st.warning(
+        '**Anomaly score is a relative outlier rank, not a probability of malicious behaviour.** '
+        'It answers "how unusual is this profile compared to the others currently in the database" — '
+        'nothing more. A score of 85 does not mean 85% likely to be malicious, and it is not '
+        'comparable across different populations, because the scale is recomputed from whichever '
+        'profiles are loaded at the time.',
+        icon=':material/priority_high:',
+    )
+
     with st.container(border=True):
         rc1, rc2 = st.columns([3, 2], vertical_alignment='center')
         with rc1:
@@ -732,6 +741,104 @@ with tab_insights:
                 'avg_anomaly': st.column_config.NumberColumn('Avg anomaly', format='%.1f'),
             },
         )
+
+    st.divider()
+    st.markdown('#### Do the weights hold up?')
+    st.caption(
+        'Measured evidence for the 40/25/20/15 split, rather than an assertion that it is correct. '
+        'There is no ground truth to fit weights against, so the testable question is whether the '
+        'ranking survives reasonable alternative weightings.'
+    )
+
+    try:
+        eviu = api_get('/api/bucket-contributions/', params={'platform': platform}, timeout=TIMEOUT_SCAN)
+    except Exception as e:
+        eviu = {'ok': False, 'error': str(e)}
+
+    if not eviu.get('ok'):
+        st.info(eviu.get('error', 'Ingest profiles to see weight evidence.'), icon=':material/info:')
+    else:
+        bdf = pd.DataFrame(eviu['buckets'])
+        st.markdown('**What each bucket actually contributes**')
+        st.dataframe(
+            bdf, width='stretch', hide_index=True,
+            column_config={
+                'bucket': st.column_config.TextColumn('Bucket', width='medium'),
+                'max_points': st.column_config.NumberColumn('Cap', width='small'),
+                'weight_share_pct': st.column_config.NumberColumn('Share of budget', format='%.0f%%'),
+                'mean_points': st.column_config.NumberColumn('Mean awarded', format='%.2f'),
+                'stdev_points': st.column_config.NumberColumn('Spread (stdev)', format='%.2f',
+                                                              help='What actually moves profiles up or down the ranking.'),
+                'min_points': st.column_config.NumberColumn('Min', format='%.1f'),
+                'max_observed': st.column_config.NumberColumn('Max seen', format='%.1f'),
+                'pct_scoring_zero': st.column_config.NumberColumn('Scoring zero', format='%.1f%%'),
+                'budget_utilisation_pct': st.column_config.ProgressColumn(
+                    'Budget used', min_value=0, max_value=100, format='%.1f%%'),
+            },
+        )
+        st.caption(eviu.get('note', ''))
+
+        for d in eviu.get('dormant_buckets', []):
+            st.warning(
+                f"**Known calibration gap — `{d['bucket']}` is allocated {d['max_points']} of 100 points "
+                f"but scores zero for {d['pct_scoring_zero']}% of profiles in this dataset.** That budget is "
+                f"effectively unreachable, so the practical maximum score is about "
+                f"**{eviu['practical_ceiling']:.0f}, not 100** (highest actually observed: "
+                f"{eviu['observed_max_score']}). The Critical tier at 90+ is therefore out of reach here. "
+                'Left as-is rather than re-tuned, because re-weighting to fit one dataset is its own '
+                'form of overfitting — but it is a real limitation, not a rounding artefact.',
+                icon=':material/report:',
+            )
+
+        ws = eviu.get('weight_sensitivity') or {}
+        if ws.get('ok'):
+            st.markdown('**Does the ranking survive different weights?**')
+            wdf = pd.DataFrame([
+                {
+                    'Weighting': v['name'],
+                    'Split': '/'.join(str(v['weights'][k]) for k in
+                                      ['pii_exposure', 'predictability', 'content_sensitivity', 'exposure_reach']),
+                    'What it changes': v['description'],
+                    'Rank correlation': v['rank_correlation'],
+                    'Top-10 kept': v['top_n_overlap_pct'],
+                    'Tier changes': v['tier_change_pct'],
+                    'Mean score shift': v['mean_abs_score_change'],
+                }
+                for v in ws['variants']
+            ])
+            st.dataframe(
+                wdf, width='stretch', hide_index=True,
+                column_config={
+                    'Weighting': st.column_config.TextColumn(width='small'),
+                    'Split': st.column_config.TextColumn('PII/Pred/Content/Reach', width='small'),
+                    'What it changes': st.column_config.TextColumn(width='medium'),
+                    'Rank correlation': st.column_config.ProgressColumn(
+                        min_value=0, max_value=1, format='%.4f',
+                        help='Spearman vs baseline ordering. 1.0 = identical ranking.'),
+                    'Top-10 kept': st.column_config.NumberColumn(format='%.0f%%'),
+                    'Tier changes': st.column_config.NumberColumn(format='%.1f%%'),
+                    'Mean score shift': st.column_config.NumberColumn(format='%.2f'),
+                },
+            )
+            s = ws['summary']
+            if s['ranking_is_robust']:
+                st.success(
+                    f"Ranking is **stable** under reweighting: the worst case still agrees with the "
+                    f"baseline at Spearman **{s['min_rank_correlation']:.3f}**, moving at most "
+                    f"**{s['max_tier_change_pct']}%** of profiles across a tier. The ordering does not "
+                    'hinge on the exact weights chosen.',
+                    icon=':material/verified:',
+                )
+            else:
+                st.warning(
+                    f"Ranking is **sensitive** to reweighting here: the worst case falls to Spearman "
+                    f"**{s['min_rank_correlation']:.3f}**, with up to **{s['max_tier_change_pct']}%** of "
+                    'profiles changing tier. The specific weights materially affect who ranks highest, '
+                    'so the ordering should be read as one defensible heuristic among several — not as '
+                    'an objective ranking.',
+                    icon=':material/warning:',
+                )
+            st.caption(ws.get('interpretation', ''))
 
     st.divider()
     st.markdown('#### How the exposure risk score is computed')

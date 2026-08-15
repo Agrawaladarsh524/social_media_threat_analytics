@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import statistics
 import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -23,6 +24,13 @@ from .services.apify_collect import collect_osint
 from .services.local_ingest import ingest_linkedin_rows, ingest_twitter_rows
 from .services.ml_models import clear_persisted_models, linkedin_ml_features, run_anomaly_and_clusters, twitter_ml_features
 from .services.openai_insights import generate_ai_bundle
+from .services.risk_engine import (
+    MAX_CONTENT_SENSITIVITY,
+    MAX_EXPOSURE_REACH,
+    MAX_PII_EXPOSURE,
+    MAX_PREDICTABILITY,
+)
+from .services.weight_analysis import analyse_weight_sensitivity
 from .services.stats import build_profile_defaults
 
 router = APIRouter()
@@ -245,6 +253,91 @@ def recompute_models(platform: str = 'twitter', force_retrain: bool = False, db:
     db.commit()
 
     return JSONResponse({'ok': True, 'platform': platform, 'diagnostics': diagnostics})
+
+
+@router.get('/bucket-contributions/')
+def bucket_contributions(platform: str = 'twitter', db: Session = Depends(get_db)) -> JSONResponse:
+    """
+    Measured evidence for the scoring weights: how many points each bucket
+    actually contributes across the stored population, versus the maximum it
+    is allowed to contribute.
+
+    This exists because "why 40/25/20/15?" is otherwise unanswerable. Rather
+    than asserting the weights are right, it reports what they do in practice
+    — including the uncomfortable parts, e.g. a bucket that is allocated a
+    large share of the budget but is zero for most real profiles, which caps
+    the score range below 100 and makes the top tier unreachable.
+    """
+    if platform not in PLATFORM_MODELS:
+        return JSONResponse({'ok': False, 'error': "platform must be 'twitter' or 'linkedin'"}, status_code=400)
+
+    profiles = list(db.scalars(select(PLATFORM_MODELS[platform])))
+    if not profiles:
+        return JSONResponse({'ok': False, 'error': 'No profiles stored for this platform.'})
+
+    caps = {
+        'pii_exposure': MAX_PII_EXPOSURE,
+        'predictability': MAX_PREDICTABILITY,
+        'content_sensitivity': MAX_CONTENT_SENSITIVITY,
+        'exposure_reach': MAX_EXPOSURE_REACH,
+    }
+    per_bucket: dict[str, list[float]] = {c: [] for c in caps}
+    for p in profiles:
+        totals = dict.fromkeys(caps, 0.0)
+        for factor in (p.risk_factors or []):
+            cat = factor.get('category')
+            if cat in totals:
+                totals[cat] += float(factor.get('points') or 0)
+        for cat, val in totals.items():
+            per_bucket[cat].append(val)
+
+    n = len(profiles)
+    rows = []
+    for cat, cap in caps.items():
+        vals = per_bucket[cat]
+        mean = statistics.mean(vals)
+        rows.append({
+            'bucket': cat,
+            'max_points': cap,
+            'weight_share_pct': round(cap / sum(caps.values()) * 100, 1),
+            'mean_points': round(mean, 2),
+            'stdev_points': round(statistics.pstdev(vals), 2) if n > 1 else 0.0,
+            'min_points': round(min(vals), 1),
+            'max_observed': round(max(vals), 1),
+            'pct_scoring_zero': round(sum(1 for v in vals if v == 0) / n * 100, 1),
+            'budget_utilisation_pct': round(mean / cap * 100, 1) if cap else 0.0,
+        })
+
+    observed_max = round(sum(r['max_observed'] for r in rows), 1)
+    theoretical_max = float(sum(caps.values()))
+
+    # A bucket that is almost never awarded still consumes its share of the
+    # 0-100 budget, which lowers the score ceiling the population can actually
+    # reach and can put a tier out of range entirely. Surfaced rather than left
+    # for someone to discover from the fact that no profile is ever Critical.
+    dormant = [
+        {'bucket': r['bucket'], 'max_points': r['max_points'], 'pct_scoring_zero': r['pct_scoring_zero']}
+        for r in rows if r['pct_scoring_zero'] >= 75
+    ]
+    unreachable_headroom = sum(d['max_points'] for d in dormant)
+
+    return JSONResponse({
+        'ok': True,
+        'platform': platform,
+        'n_profiles': n,
+        'buckets': rows,
+        'theoretical_max_score': theoretical_max,
+        'observed_max_score': max((p.risk_score or 0) for p in profiles),
+        'sum_of_per_bucket_maxima': observed_max,
+        'dormant_buckets': dormant,
+        'practical_ceiling': round(theoretical_max - unreachable_headroom, 1),
+        'weight_sensitivity': analyse_weight_sensitivity(profiles),
+        'note': (
+            'Spread (stdev) is what moves a profile up or down the ranking — a bucket with '
+            'a large cap but near-zero spread contributes little to how profiles are ordered, '
+            'however much budget it is allocated.'
+        ),
+    })
 
 
 @router.get('/profiles-summary/')

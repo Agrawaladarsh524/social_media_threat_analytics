@@ -60,6 +60,18 @@ core pipeline depends on it.
   personas. Cluster identity is preserved across refits (a persisted scaler
   plus centroid remapping), so a persona's ID doesn't drift just because the
   model was refit — see `ml_models.py`.
+- 🔒 **Feature-schema guard on persisted models** — the scaler is fingerprinted
+  against the extractor that fed it (declared names *and* the function's own
+  bytecode). scikit-learn raises on a feature-count mismatch but is silent when
+  columns are merely reordered — which silently applied the wrong per-column
+  statistics and shifted a measured silhouette from 0.311/k=2 to 0.576/k=5.
+  A schema change now forces a refit instead.
+- 📐 **The weights are tested, not asserted** — a weight-sensitivity analysis
+  rescores every profile under alternative weightings and reports rank
+  correlation, top-10 overlap, tier-change rate, and mean score shift. It
+  found that the Twitter ranking is stable under reweighting while the
+  LinkedIn ranking is *not* — both reported in the dashboard rather than
+  hidden.
 - 🕰️ **Real audit trail, not a synthetic timeline** — every scoring event is
   appended to `risk_snapshots`, so re-ingesting after a methodology change
   produces genuine before/after history instead of a fabricated backfill.
@@ -136,6 +148,7 @@ osint-guard/
 │   │       ├── risk_engine.py      Platform-agnostic, confidence-weighted risk-scoring core
 │   │       ├── nlp_features.py     spaCy NER + keywords + sentence-embedding exemplar similarity
 │   │       ├── ml_models.py        Isolation Forest + KMeans, persisted scaler + centroid remapping
+│   │       ├── weight_analysis.py  Weight-sensitivity: rescore under alternative weightings
 │   │       ├── local_ingest.py     CSV -> features -> score -> persist + snapshot, no API key
 │   │       ├── stats.py            Deterministic tweet-engagement metrics
 │   │       ├── analytics.py        Seaborn/matplotlib chart export (PNG)
@@ -225,6 +238,7 @@ you're using the optional live-scrape/LLM path**; the local pipeline needs none 
 | `GET` | `/api/check-db/` | Fetch the 50 most recently scanned profiles |
 | `GET` | `/api/profile-detail/{platform}/{identifier}/` | Full itemized risk-factor breakdown for one profile |
 | `GET` | `/api/snapshots/{platform}/{identifier}/` | Every past scoring event for one profile, oldest first — the real (non-synthetic) audit trail |
+| `GET` | `/api/bucket-contributions/` | Measured evidence for the scoring weights: per-bucket spread and budget utilisation, dormant-bucket detection, and the weight-sensitivity comparison |
 | `GET` | `/api/usernames/` | List every stored handle/identifier for a platform |
 | `GET / POST / DELETE` | `/api/clear-db/` | Wipe stored profiles for a platform |
 | `POST` | `/api/collect/` | *Optional.* Scrape a handle's public tweets via Apify |
@@ -269,10 +283,36 @@ pytest tests/ -v
 
 Covers the risk engine (score bounds, tier ordering, confidence weighting on
 both platforms), the NLP feature extractors (entity extraction, keyword
-matching), the unsupervised ML layer (outlier detection, k-selection,
-cluster-identity stability across independent refits), and the
+matching, semantic similarity), the unsupervised ML layer (outlier detection,
+k-selection, cluster-identity stability across refits, and the feature-schema
+guard against reordered or swapped extractors), the weight-sensitivity
+analysis (including a round-trip check that recomputation under the shipping
+weights exactly reproduces the engine's own scores), and the
 ingestion/analytics routes end to end via FastAPI's `TestClient` against an
-isolated temp database.
+isolated temp database and model directory.
+
+## Known Limitations
+
+Measured on the datasets in use (140 Twitter profiles, 1,000 LinkedIn
+profiles), surfaced in the Model Insights tab rather than left to be
+discovered:
+
+- **The practical score ceiling is ~80, not 100.** `content_sensitivity` is
+  allocated 20 of the 100 points but scores zero for 91% of Twitter and 97.5%
+  of LinkedIn profiles — real posts rarely contain the near-term personal
+  disclosures it looks for. That budget is effectively unreachable, so the
+  **Critical tier (90+) cannot be reached** on this data (highest observed:
+  64 Twitter, 81 LinkedIn). Left un-retuned deliberately: re-weighting to fit
+  one dataset is its own form of overfitting.
+- **LinkedIn's ranking is sensitive to the weight choice.** The weight
+  sensitivity analysis reports Spearman 0.82 against the baseline ordering in
+  the worst variant (Twitter holds at 0.94). The LinkedIn ordering should be
+  read as one defensible heuristic among several, not as objective.
+- **Anomaly scores are population-relative.** Isolation Forest output is
+  min-max rescaled across whatever profiles are currently loaded, so a score
+  of 85 is a rank within that population — not a probability, and not
+  comparable across different datasets.
+- **No supervised validation, by design.** See below.
 
 ## Deliberately Not Built
 
@@ -293,6 +333,13 @@ deprioritized — worth stating explicitly rather than leaving as a silent gap:
   population against a fixed training distribution. Isolation Forest and
   KMeans here refit fresh every call by design, so there's no fixed baseline
   to drift away from — instrumentation with nothing real to measure.
+- **API pagination.** Measured: the uncapped summary endpoint returns 421 KB in
+  95 ms for 1,000 profiles, so there is nothing to fix at this scale. More
+  importantly, paginating it *without* server-side aggregation would corrupt
+  the dashboard — at `page_size=100` the reported mean moves from 59.6 to 70.3
+  and the High tier count from 142 to 59, because every histogram, tier
+  breakdown and KPI is computed from that payload. Correct at scale would be
+  server-side aggregation, which this dataset does not justify.
 
 ## Roadmap
 

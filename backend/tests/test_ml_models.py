@@ -122,6 +122,82 @@ def test_force_retrain_resets_cluster_identity_tracking():
     assert diag['cluster_ids_stable_across_refits'] is False
 
 
+def _reordered_features(p):
+    """Same four features as twitter_ml_features, different column order."""
+    return [p.total_likes / max(p.total_tweets, 1),
+            p.avg_engagement,
+            np.log1p(p.followers_count),
+            p.followers_count / max(p.following_count, 1)]
+
+
+def _swapped_field_features(p):
+    """Same column count and order, but one field swapped for a different one."""
+    return [np.log1p(p.total_likes),
+            p.followers_count / max(p.following_count, 1),
+            p.avg_engagement,
+            p.total_likes / max(p.total_tweets, 1)]
+
+
+def test_correct_extractor_reuses_persisted_scaler():
+    profiles = _synthetic_population(n=25)
+    _a, _c, first = ml_models.run_anomaly_and_clusters(profiles, ml_models.twitter_ml_features, 'twitter')
+    assert first['model']['refit'] is True  # nothing persisted yet
+    _a, _c, second = ml_models.run_anomaly_and_clusters(profiles, ml_models.twitter_ml_features, 'twitter')
+    assert second['model']['refit'] is False  # no needless refit
+
+
+def test_reordered_extractor_is_detected_and_refit():
+    """The bug this guard exists for: scikit-learn raises on a feature-COUNT
+    mismatch but is silent when columns are merely reordered, so a stale
+    scaler applies the wrong per-column statistics. Measured effect before
+    the fix was silhouette 0.576/k=5 against a correct 0.311/k=2."""
+    profiles = _synthetic_population(n=25)
+    _a, _c, correct = ml_models.run_anomaly_and_clusters(profiles, ml_models.twitter_ml_features, 'twitter')
+    _a, _c, reordered = ml_models.run_anomaly_and_clusters(profiles, _reordered_features, 'twitter')
+
+    assert reordered['model']['refit'] is True
+    assert 'schema changed' in reordered['model']['refit_reason']
+    # Column order must not change the result once the scaler is refit correctly.
+    assert reordered['silhouette_score'] == correct['silhouette_score']
+    assert reordered['k'] == correct['k']
+
+
+def test_swapped_field_extractor_is_detected():
+    profiles = _synthetic_population(n=25)
+    ml_models.run_anomaly_and_clusters(profiles, ml_models.twitter_ml_features, 'twitter')
+    _a, _c, swapped = ml_models.run_anomaly_and_clusters(profiles, _swapped_field_features, 'twitter')
+    assert swapped['model']['refit'] is True
+
+
+def test_wrong_feature_count_is_rejected_with_a_clear_reason():
+    profiles = _synthetic_population(n=25)
+    _a, _c, diag = ml_models.run_anomaly_and_clusters(
+        profiles, lambda p: [1.0, 2.0, 3.0], 'twitter',  # 3 features, schema declares 4
+    )
+    assert diag['ok'] is False
+    assert 'schema' in diag['reason'].lower()
+
+
+def test_model_metadata_records_provenance():
+    profiles = _synthetic_population(n=25)
+    _a, _c, diag = ml_models.run_anomaly_and_clusters(profiles, ml_models.twitter_ml_features, 'twitter')
+    meta = diag['model']
+    assert meta['training_population'] == 25
+    assert meta['feature_names'] == ml_models.TWITTER_FEATURE_NAMES
+    assert len(meta['schema_fingerprint']) == 16
+    assert meta['trained_at']
+
+    stored = ml_models.load_model_metadata('twitter')
+    assert stored['schema_fingerprint'] == meta['schema_fingerprint']
+
+
+def test_fingerprint_changes_with_names_and_with_implementation():
+    base = ml_models.schema_fingerprint(['a', 'b'], ml_models.twitter_ml_features)
+    assert base != ml_models.schema_fingerprint(['a', 'c'], ml_models.twitter_ml_features)   # names
+    assert base != ml_models.schema_fingerprint(['a', 'b'], _reordered_features)             # implementation
+    assert base == ml_models.schema_fingerprint(['a', 'b'], ml_models.twitter_ml_features)   # stable
+
+
 def test_clear_persisted_models_removes_artifacts(tmp_path):
     profiles = _synthetic_population(n=25)
     ml_models.run_anomaly_and_clusters(profiles, ml_models.twitter_ml_features, 'twitter')
