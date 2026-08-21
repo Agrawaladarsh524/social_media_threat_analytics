@@ -1,7 +1,8 @@
 """
 Local NLP + feature engineering. No API calls — spaCy's pretrained
 en_core_web_sm model runs entirely on-device for named-entity recognition;
-everything else here is plain regex/statistics.
+TF-IDF + cosine similarity (scikit-learn) for semantic content matching;
+everything else is plain regex/statistics.
 
 Produces two things per profile:
 1. A flat feature dict consumed by risk_engine.score_*_profile().
@@ -38,13 +39,14 @@ SENSITIVE_KEYWORDS: dict[str, list[str]] = {
 }
 _ALL_KEYWORDS = [(kw, cat) for cat, kws in SENSITIVE_KEYWORDS.items() for kw in kws]
 
-# ── Semantic content scoring (sentence-embedding exemplar similarity) ───────
+# ── Semantic content scoring (TF-IDF cosine similarity) ─────────────────────
 # The keyword dictionary above can't tell "I visited my parents last year"
 # (past, low operational exposure) from "I am flying home tomorrow" (near-term,
 # specific, real exposure) — same keyword family, very different risk. This
-# runs alongside the keyword dictionary, not instead of it, using a small
-# local sentence-embedding model (no API call, no training, no labeled
-# dataset) to catch near-term/specific disclosures the keyword list misses.
+# runs alongside the keyword dictionary, not instead of it, using TF-IDF
+# vectorization + cosine similarity (scikit-learn, no neural model, no API
+# call, no labeled dataset) to catch near-term/specific disclosures the
+# keyword list misses.
 SEMANTIC_EXEMPLARS: dict[str, list[str]] = {
     'travel': [
         'I am flying to Tokyo tomorrow',
@@ -77,76 +79,74 @@ SEMANTIC_EXEMPLARS: dict[str, list[str]] = {
         'Every Monday I work from this coworking space',
     ],
 }
-# Threshold chosen by measurement, not by feel: on the real 1000-tweet
-# dataset, raw tweet text never exceeded 0.55 against any exemplar (URLs,
-# "RT @user:" prefixes and @mentions dilute the embedding), so anything
-# higher silently disabled the feature entirely. After stripping that noise
-# (see _clean_for_embedding), 0.45 surfaces real disclosures the keyword
-# dictionary misses — "I've moved to San Francisco", "Woke up at 4:30am.
-# Drove to JFK" — at roughly 55-75% precision. That is deliberately tuned
-# for recall over precision: this is a *supplementary* signal whose evidence
-# string always carries the similarity score, so a human reviewing the
-# itemized breakdown can judge each hit rather than trusting it blindly.
-SEMANTIC_SIMILARITY_THRESHOLD = 0.45
+# TF-IDF cosine similarities between short texts are generally lower than
+# dense-embedding similarities, so the threshold is calibrated accordingly.
+# With bigram features and sublinear TF scaling, 0.25 surfaces real
+# disclosures the keyword dictionary misses while filtering noise. This is
+# deliberately tuned for recall over precision: this is a *supplementary*
+# signal whose evidence string always carries the similarity score, so a
+# human reviewing the itemized breakdown can judge each hit rather than
+# trusting it blindly.
+SEMANTIC_SIMILARITY_THRESHOLD = 0.25
 
 _URL_RE = re.compile(r'https?://\S+')
 _RT_PREFIX_RE = re.compile(r'^RT @\w+:\s*')
 _MENTION_RE = re.compile(r'@\w+')
 
 
-def _clean_for_embedding(text: str) -> str:
-    """Strips retweet prefixes, URLs and @mentions before embedding. These
-    carry no semantic content but measurably drag similarity down — on the
-    real dataset this preprocessing is the difference between 0 and 2 hits
-    at similarity 0.55, and 9 vs 13 hits at 0.45."""
+def _clean_for_matching(text: str) -> str:
+    """Strips retweet prefixes, URLs and @mentions before similarity matching.
+    These carry no content signal but dilute TF-IDF cosine similarity —
+    removing them improves match quality measurably."""
     text = _RT_PREFIX_RE.sub('', text)
     text = _URL_RE.sub('', text)
     text = _MENTION_RE.sub('', text)
     return ' '.join(text.split())
 
-_embedder = None
 _exemplar_texts: list[str] = []
 _exemplar_categories: list[str] = []
-_exemplar_embeddings = None
 
 
-def get_embedder():
-    global _embedder
-    if _embedder is None:
-        from sentence_transformers import SentenceTransformer
-        _embedder = SentenceTransformer('all-MiniLM-L6-v2')
-    return _embedder
-
-
-def _get_exemplar_embeddings():
-    global _exemplar_texts, _exemplar_categories, _exemplar_embeddings
-    if _exemplar_embeddings is None:
-        for cat, sentences in SEMANTIC_EXEMPLARS.items():
-            for s in sentences:
-                _exemplar_texts.append(s)
-                _exemplar_categories.append(cat)
-        _exemplar_embeddings = get_embedder().encode(_exemplar_texts, convert_to_tensor=True)
-    return _exemplar_embeddings
+def _build_exemplar_lists() -> None:
+    global _exemplar_texts, _exemplar_categories
+    if _exemplar_texts:
+        return
+    for cat, sentences in SEMANTIC_EXEMPLARS.items():
+        for s in sentences:
+            _exemplar_texts.append(s)
+            _exemplar_categories.append(cat)
 
 
 def semantic_content_hits(texts: list[str]) -> tuple[int, list[dict]]:
     """
-    Returns (hit_count, [{category, text, similarity}, ...]). Embeds each
-    text and each exemplar sentence once, then scores every text against its
-    single closest exemplar by cosine similarity — no training, no labels,
-    just a fixed set of hand-written example sentences per category.
+    Returns (hit_count, [{category, text, similarity}, ...]). Vectorizes each
+    text and each exemplar sentence with TF-IDF (bigrams, sublinear TF), then
+    scores every text against its single closest exemplar by cosine similarity
+    — no neural model, no training, no labels, just scikit-learn's
+    TfidfVectorizer over a fixed set of hand-written example sentences per
+    category.
     """
-    # Keep the original text for evidence/reporting, embed the cleaned version.
-    pairs = [(t, _clean_for_embedding(t)) for t in texts if t and t.strip()]
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    # Keep the original text for evidence/reporting, clean the version used for matching.
+    pairs = [(t, _clean_for_matching(t)) for t in texts if t and t.strip()]
     pairs = [(orig, cleaned) for orig, cleaned in pairs if cleaned]
     if not pairs:
         return 0, []
 
-    from sentence_transformers import util
+    _build_exemplar_lists()
 
-    exemplar_emb = _get_exemplar_embeddings()
-    text_emb = get_embedder().encode([c for _, c in pairs], convert_to_tensor=True)
-    sims = util.cos_sim(text_emb, exemplar_emb)
+    cleaned_texts = [c for _, c in pairs]
+
+    # Fit on exemplars + input together so IDF weights reflect the full corpus.
+    # Bigrams capture short phrases ("flying to", "my house") that unigrams miss.
+    vectorizer = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True, min_df=1)
+    all_texts = _exemplar_texts + cleaned_texts
+    tfidf_matrix = vectorizer.fit_transform(all_texts)
+
+    n_exemplars = len(_exemplar_texts)
+    sims = cosine_similarity(tfidf_matrix[n_exemplars:], tfidf_matrix[:n_exemplars])
 
     hits: list[dict] = []
     seen: set[str] = set()

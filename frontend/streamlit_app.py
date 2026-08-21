@@ -6,7 +6,8 @@ here — theming comes from .streamlit/config.toml, charts from Plotly's
 native Streamlit integration.
 
 Primary intelligence path is fully local (rule-based risk engine + spaCy NER
-+ Isolation Forest/KMeans, see backend/app/services/): no OpenAI key needed.
++ TF-IDF similarity + Isolation Forest/KMeans, see backend/app/services/):
+no OpenAI key needed.
 The original OpenAI-powered scan/upload flow is kept as an optional,
 clearly-labeled "advanced" path for users who add a key later.
 
@@ -166,7 +167,7 @@ with st.sidebar:
 
     st.subheader('How scoring works', divider='gray')
     st.caption(
-        'A deterministic weighted rule engine + local spaCy NER + sentence-embedding '
+        'A deterministic weighted rule engine + local spaCy NER + TF-IDF cosine '
         'similarity, with Isolation Forest / KMeans on top. Every point is traceable '
         'to a specific signal — see **Model Insights** for the full methodology.'
     )
@@ -321,7 +322,7 @@ with tab_lookup:
             rows = p.get('inference_rows') or []
             if rows:
                 st.markdown('#### Extracted signals')
-                st.caption('Real entities pulled from public text by local spaCy NER and sentence-embedding similarity.')
+                st.caption('Real entities pulled from public text by local spaCy NER and TF-IDF cosine similarity.')
                 st.dataframe(
                     pd.DataFrame(rows), width='stretch', hide_index=True,
                     column_config={
@@ -852,12 +853,10 @@ The score is a **deterministic, weighted sum** across four buckets (no black box
 | --- | --- | --- |
 | PII exposure | 40 | Email/LinkedIn/employer disclosed in profile metadata + locations mentioned in tweets (spaCy NER) |
 | Behavioral predictability | 25 | Entropy of posting-hour histogram, **confidence-weighted by tweet count** so a single tweet can't fake a "routine" |
-| Content sensitivity | 20 | Two signals, **unioned not summed** (a tweet caught by both counts once): a keyword dictionary, plus local sentence-embedding similarity to hand-written example disclosures. The second catches what the first structurally can't — "I've moved to San Francisco", "Woke up at 4:30am, drove to JFK" — and every hit carries its similarity score as evidence so you can judge it |
+| Content sensitivity | 20 | Two signals, **unioned not summed** (a tweet caught by both counts once): a keyword dictionary, plus TF-IDF cosine similarity (scikit-learn) against hand-written example disclosures. The second catches what the first structurally can't — shared vocabulary with known disclosure patterns — and every hit carries its similarity score as evidence so you can judge it |
 | Exposure reach | 15 | Follower count (log-scaled) |
 
 Separately, an **Isolation Forest** flags statistically anomalous accounts (unusual followers/following/engagement ratios) — an authenticity signal, not folded into the exposure risk score itself. **KMeans** groups accounts into behavioral personas, with cluster IDs matched back to the previous run's so a persona's identity survives a refit.
-
-*Measured on this dataset (140 profiles / 1000 tweets): semantic similarity raised content-sensitivity detections from 5 to 17, affecting 8 profiles. Tuned for recall over precision — roughly 2 in 3 hits are clearly meaningful, which is why each one shows its similarity score rather than being silently folded in.*
             """
         )
     else:

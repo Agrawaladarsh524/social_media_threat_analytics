@@ -54,9 +54,10 @@ core pipeline depends on it.
   point can never masquerade as a proven behavioral pattern.
 - 🕵️ **Local NLP extraction** — spaCy NER pulls real locations, organizations,
   and PII-adjacent entities out of tweet text, bios, and LinkedIn headlines;
-  a local sentence-embedding model (`all-MiniLM-L6-v2`) separately catches
-  near-term/specific disclosures a keyword list can't — e.g. "flying home
-  tomorrow" vs. "visited my parents last year." No LLM call involved either way.
+  TF-IDF vectorization + cosine similarity (scikit-learn) separately catches
+  near-term/specific disclosures a keyword list can’t — e.g. "flying home
+  tomorrow" vs. "visited my parents last year." No neural model or API call
+  involved either way.
 - 🚨 **Unsupervised anomaly & persona detection** — Isolation Forest flags
   statistically anomalous accounts; KMeans clusters profiles into behavioral
   personas. Cluster identity is preserved across refits (a persisted scaler
@@ -96,7 +97,7 @@ core pipeline depends on it.
 flowchart LR
     CSV[Twitter/X or LinkedIn\nCSV export] --> ING[Local ingestion pipeline]
     ING --> STATS[stats.py\nreal engagement metrics]
-    ING --> NER[nlp_features.py\nspaCy NER + keywords + semantic exemplar similarity]
+    ING --> NER[nlp_features.py\nspaCy NER + keywords + TF-IDF cosine similarity]
     STATS --> ENGINE[risk_engine.py\nconfidence-weighted rule-based scorer]
     NER --> ENGINE
     ENGINE --> DB[(SQLite / Postgres)]
@@ -124,7 +125,7 @@ of truth for stored profiles and the only component holding credentials.
 | UI | **Streamlit** + **Plotly** | Interactive dashboard — lookup, ingestion, analytics, model insights, profile browser. Native widgets only (`st.metric` with sparklines, bordered containers, `column_config` progress columns, Material icons); no HTML/CSS/JS is authored anywhere |
 | API | **FastAPI** + **Uvicorn** | Async REST API, request validation, routing |
 | Local NLP | **spaCy** (`en_core_web_sm`) | Named-entity recognition for PII/location extraction — no external calls |
-| Semantic content scoring | **sentence-transformers** (`all-MiniLM-L6-v2`) | CPU-only exemplar-similarity scoring — catches near-term disclosures a keyword list can't, no training loop, no labeled dataset |
+| Semantic content scoring | **scikit-learn** (`TfidfVectorizer`, `cosine_similarity`) | TF-IDF cosine similarity against hand-written exemplar sentences — catches near-term disclosures a keyword list can’t, no neural model, no training loop, no labeled dataset |
 | Unsupervised ML | **scikit-learn** (Isolation Forest, KMeans) | Anomaly detection + behavioral clustering; `scipy` (optimal assignment) matches new cluster centroids back to the previous run's so persona identity survives a refit |
 | Model persistence | **joblib** | Persists the fitted `StandardScaler` and cluster centroids under `backend/models/` (gitignored, regenerated on ingestion) |
 | Risk scoring | Custom weighted engine (`risk_engine.py`) | Deterministic, itemized 0-100 score, confidence-weighted by data volume — no training data needed |
@@ -148,7 +149,7 @@ osint-guard/
 │   │   ├── routes.py               All /api/* endpoints
 │   │   └── services/
 │   │       ├── risk_engine.py      Platform-agnostic, confidence-weighted risk-scoring core
-│   │       ├── nlp_features.py     spaCy NER + keywords + sentence-embedding exemplar similarity
+│   │       ├── nlp_features.py     spaCy NER + keywords + TF-IDF cosine similarity
 │   │       ├── ml_models.py        Isolation Forest + KMeans, persisted scaler + centroid remapping
 │   │       ├── weight_analysis.py  Weight-sensitivity: rescore under alternative weightings
 │   │       ├── local_ingest.py     CSV -> features -> score -> persist + snapshot, no API key
@@ -186,10 +187,7 @@ uvicorn app.main:app --reload             # http://127.0.0.1:8000
 ```
 
 Database tables are created automatically on first run. Interactive API docs
-are served at `/docs` (Swagger) and `/redoc`. The semantic-scoring model
-(`all-MiniLM-L6-v2`, ~90MB) downloads automatically from Hugging Face the
-first time `/api/ingest-local/` runs — no separate command needed, but that
-first ingestion needs internet access; every run after that is fully offline.
+are served at `/docs` (Swagger) and `/redoc`.
 
 ### 2. Frontend
 

@@ -14,7 +14,6 @@ pandas>=2.2,<3
 numpy>=1.26,<3
 scikit-learn>=1.4,<2
 spacy>=3.7,<4
-sentence-transformers>=3.0,<4  # semantic content scoring — CPU-only, all-MiniLM-L6-v2
 # One-time model download after installing requirements:
 #   python -m spacy download en_core_web_sm
 

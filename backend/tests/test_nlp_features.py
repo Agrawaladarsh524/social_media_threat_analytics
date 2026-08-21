@@ -1,7 +1,7 @@
 """Tests for local spaCy NER extraction and feature engineering — no network
-calls, no OpenAI key. spaCy's en_core_web_sm and the sentence-transformers
-all-MiniLM-L6-v2 model must be available (the latter downloads automatically
-from Hugging Face on first use of semantic_content_hits)."""
+calls, no OpenAI key. spaCy's en_core_web_sm must be available. Semantic
+content matching uses scikit-learn's TfidfVectorizer (no external model
+download needed)."""
 
 from app.services.nlp_features import (
     count_sensitive_keyword_hits,
